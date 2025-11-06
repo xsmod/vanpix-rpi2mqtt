@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"strconv"
@@ -27,30 +26,60 @@ func env(key, def string) string {
 	return v
 }
 
-func main() {
-	// Configuration from environment
-	broker := env("MQTT_BROKER", "tcp://localhost:1883")
-	user := env("MQTT_USER", "")
-	pass := env("MQTT_PASSWORD", "")
-	clientID := env("MQTT_CLIENT_ID", "rpi-stats")
-	prefix := env("MQTT_TOPIC_PREFIX", "rpi-stats")
+type AppConfig struct {
+	Broker       string
+	User         string
+	Password     string
+	ClientID     string
+	Prefix       string
+	IntervalSec  int
+	DeviceName   string
+	HADiscovery  bool
+	HAPrefix     string
+	HostDiskPath string
+}
+
+func loadConfig() AppConfig {
 	intervalSec, _ := strconv.Atoi(env("INTERVAL_SECONDS", "30"))
 	if intervalSec <= 0 {
 		intervalSec = 30
 	}
-	deviceName := env("DEVICE_NAME", "rpi")
-	haDiscovery := strings.ToLower(env("HA_DISCOVERY", "true")) != "false"
-	haPrefix := env("HA_PREFIX", "homeassistant")
-	// Path to use for disk calculations (allows mounting host root to /host and setting HOST_ROOT_PATH=/host)
-	hostDiskPath = env("HOST_ROOT_PATH", "/")
-
-	opts := mqtt.NewClientOptions()
-	opts.AddBroker(broker)
-	opts.SetClientID(clientID)
-	if user != "" {
-		opts.Username = user
-		opts.Password = pass
+	user := env("MQTT_USER", "")
+	pass := env("MQTT_PASSWORD", "")
+	// If user is empty we ignore password (anonymous connection)
+	if user == "" {
+		pass = ""
 	}
+	return AppConfig{
+		Broker:       env("MQTT_BROKER", "tcp://localhost:1883"),
+		User:         user,
+		Password:     pass,
+		ClientID:     env("MQTT_CLIENT_ID", "rpi-stats"),
+		Prefix:       env("MQTT_TOPIC_PREFIX", "rpi-stats"),
+		IntervalSec:  intervalSec,
+		DeviceName:   env("DEVICE_NAME", "rpi"),
+		HADiscovery:  strings.ToLower(env("HA_DISCOVERY", "true")) != "false",
+		HAPrefix:     env("HA_PREFIX", "homeassistant"),
+		HostDiskPath: env("HOST_ROOT_PATH", "/"),
+	}
+}
+
+func applyConfigToOptions(cfg AppConfig) *mqtt.ClientOptions {
+	opts := mqtt.NewClientOptions()
+	opts.AddBroker(cfg.Broker)
+	opts.SetClientID(cfg.ClientID)
+	if cfg.User != "" { // only set creds if username provided
+		opts.Username = cfg.User
+		opts.Password = cfg.Password
+	}
+	return opts
+}
+
+func main() {
+	cfg := loadConfig()
+	hostDiskPath = cfg.HostDiskPath
+
+	opts := applyConfigToOptions(cfg)
 	client := mqtt.NewClient(opts)
 
 	// Retry connect with backoff
@@ -69,19 +98,19 @@ func main() {
 		}
 	}
 
-	deviceID := sanitize(deviceName)
+	deviceID := sanitize(cfg.DeviceName)
 
 	var wg sync.WaitGroup
 
-	if haDiscovery {
+	if cfg.HADiscovery {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			publishHADiscovery(client, haPrefix, prefix, deviceID, deviceName)
+			publishHADiscovery(client, cfg.HAPrefix, cfg.Prefix, deviceID, cfg.DeviceName)
 		}()
 	}
 
-	ticker := time.NewTicker(time.Duration(intervalSec) * time.Second)
+	ticker := time.NewTicker(time.Duration(cfg.IntervalSec) * time.Second)
 	defer ticker.Stop()
 
 	// Setup signal handling for graceful shutdown (Ctrl+C)
@@ -91,30 +120,24 @@ func main() {
 	for {
 		select {
 		case <-ticker.C:
-			// Run gather+publish in background so main goroutine remains responsive to signals
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				report := gatherStats()
-				publishMetrics(client, prefix, deviceID, report)
+				publishMetrics(client, cfg.Prefix, deviceID, report)
 			}()
 		case sig := <-sigCh:
 			log.Printf("received signal %v, shutting down", sig)
-			// Stop ticker and wait for in-flight publishes (with timeout)
 			ticker.Stop()
 			done := make(chan struct{})
-			go func() {
-				wg.Wait()
-				close(done)
-			}()
+			go func() { wg.Wait(); close(done) }()
 			select {
 			case <-done:
-				// all done
 			case <-time.After(3 * time.Second):
 				log.Println("timeout waiting for in-flight publishes")
 			}
 			if client != nil && client.IsConnected() {
-				client.Disconnect(250) // wait up to 250ms for pending work
+				client.Disconnect(250)
 			}
 			return
 		}
@@ -135,8 +158,8 @@ type Stats struct {
 	MemAvailableMB int64   `json:"mem_available_mb"`
 	DiskTotalGB    float64 `json:"disk_total_gb"`
 	DiskFreeGB     float64 `json:"disk_free_gb"`
-	IP             string  `json:"ip"`
 	UptimeDays     float64 `json:"uptime_days"`
+	IP             string  `json:"ip"`
 }
 
 func gatherStats() Stats {
@@ -150,8 +173,8 @@ func gatherStats() Stats {
 		MemAvailableMB: getMemAvailableMB(),
 		DiskTotalGB:    getDiskGB(hostDiskPath),
 		DiskFreeGB:     getDiskFreeGB(hostDiskPath),
-		IP:             getIP(),
 		UptimeDays:     getUptimeDays(),
+		IP:             getConfiguredIP(),
 	}
 }
 
@@ -165,27 +188,28 @@ func publishMetrics(client mqtt.Client, prefix, device string, s Stats) {
 	publish(client, top("mem_available_mb"), fmt.Sprintf("%d", s.MemAvailableMB))
 	publish(client, top("disk_total_gb"), fmt.Sprintf("%.2f", s.DiskTotalGB))
 	publish(client, top("disk_free_gb"), fmt.Sprintf("%.2f", s.DiskFreeGB))
-	publish(client, top("ip"), s.IP)
 	publish(client, top("uptime_days"), fmt.Sprintf("%.2f", s.UptimeDays))
+	if s.IP != "" {
+		publish(client, top("ip"), s.IP)
+	}
 }
 
+// publish sends retained payload; attempts lightweight reconnect if disconnected.
 func publish(client mqtt.Client, topic, payload string) {
 	if client == nil {
 		log.Printf("mqtt client nil, cannot publish %s", topic)
 		return
 	}
 	if !client.IsConnected() {
-		// try to reconnect non-blocking with timeout
 		if token := client.Connect(); token != nil {
 			if ok := token.WaitTimeout(2 * time.Second); !ok {
-				log.Printf("publish: reconnect attempt timed out")
+				log.Printf("publish: reconnect timeout for %s", topic)
 			} else if token.Error() != nil {
-				log.Printf("publish: reconnect failed: %v", token.Error())
+				log.Printf("publish: reconnect failed for %s: %v", topic, token.Error())
 			}
 		}
 	}
 	t := client.Publish(topic, 0, true, payload)
-	// avoid waiting indefinitely
 	if ok := t.WaitTimeout(5 * time.Second); !ok {
 		log.Printf("publish %s timed out", topic)
 		return
@@ -211,8 +235,11 @@ func publishHADiscovery(client mqtt.Client, haPrefix, prefix, deviceID, deviceNa
 		{"mem_available_mb", "Memory Available", "MB", "data_size"},
 		{"disk_total_gb", "Disk Total", "GB", "data_size"},
 		{"disk_free_gb", "Disk Free", "GB", "data_size"},
-		{"ip", "IP Address", "", ""},
 		{"uptime_days", "Uptime", "d", ""},
+	}
+	if ip := getConfiguredIP(); ip != "" {
+		// add IP sensor non-numeric (no state_class)
+		sensors = append(sensors, sensorDef{"ip", "IP Address", "", ""})
 	}
 
 	for _, s := range sensors {
@@ -235,17 +262,12 @@ func publishHADiscovery(client mqtt.Client, haPrefix, prefix, deviceID, deviceNa
 		if s.DeviceClass != "" {
 			cfg["device_class"] = s.DeviceClass
 		}
-		if s.Metric != "ip" {
-			cfg["state_class"] = "measurement"
-		}
+		// all remaining metrics are numeric measurements
+		cfg["state_class"] = "measurement"
 
 		b, _ := json.Marshal(cfg)
 		topic := fmt.Sprintf("%s/sensor/%s/%s/config", haPrefix, deviceID, objectID)
-		t := client.Publish(topic, 0, true, string(b))
-		t.Wait()
-		if t.Error() != nil {
-			log.Printf("HA discovery publish failed: %v", t.Error())
-		}
+		client.Publish(topic, 0, true, string(b)).Wait()
 	}
 }
 
@@ -391,34 +413,16 @@ func getDiskFreeGB(path string) float64 {
 	return free / (1024.0 * 1024.0 * 1024.0)
 }
 
-func getIP() string {
-	ifs, err := net.Interfaces()
-	if err != nil {
-		return ""
+func getConfiguredIP() string {
+	if v := os.Getenv("IP_ADDRESS"); v != "" {
+		return v
 	}
-	for _, iface := range ifs {
-		if (iface.Flags & net.FlagUp) == 0 {
-			continue
-		}
-		if (iface.Flags & net.FlagLoopback) != 0 {
-			continue
-		}
-		addrs, _ := iface.Addrs()
-		for _, a := range addrs {
-			switch v := a.(type) {
-			case *net.IPNet:
-				ip := v.IP
-				if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
-					continue
-				}
-				if ip.To4() != nil {
-					return ip.String()
-				}
-			case *net.IPAddr:
-				ip := v.IP
-				if ip.To4() != nil && !ip.IsLoopback() {
-					return ip.String()
-				}
+	if fp := os.Getenv("IP_FILE"); fp != "" {
+		b, err := os.ReadFile(fp)
+		if err == nil {
+			ip := strings.TrimSpace(string(b))
+			if ip != "" {
+				return ip
 			}
 		}
 	}
