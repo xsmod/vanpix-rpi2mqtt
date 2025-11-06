@@ -1,0 +1,71 @@
+project_name: vanpix-rpistats2mqtt
+
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: binary
+    main: ./main.go
+    binary: rpi-stats2mqtt
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
+dockers:
+  - id: image
+    use: buildx
+    goos: linux
+    goarch: amd64
+    dockerfile: Dockerfile
+    image_templates:
+      - ghcr.io/xsmod/vanpix-rpistats2mqtt:{{ .Version }}-amd64
+      - ghcr.io/xsmod/vanpix-rpistats2mqtt:latest-amd64
+    build_flag_templates:
+      - --platform=linux/amd64
+      - --build-arg=TARGETOS=linux
+      - --build-arg=TARGETARCH=amd64
+      - --build-arg=VERSION={{ .Version }}
+  - id: image-arm64
+    use: buildx
+    goos: linux
+    goarch: arm64
+    dockerfile: Dockerfile
+    image_templates:
+      - ghcr.io/xsmod/vanpix-rpistats2mqtt:{{ .Version }}-arm64
+      - ghcr.io/xsmod/vanpix-rpistats2mqtt:latest-arm64
+    build_flag_templates:
+      - --platform=linux/arm64
+      - --build-arg=TARGETOS=linux
+      - --build-arg=TARGETARCH=arm64
+      - --build-arg=VERSION={{ .Version }}
+
+docker_manifests:
+  - name_template: ghcr.io/xsmod/vanpix-rpistats2mqtt:{{ .Version }}
+    image_templates:
+      - ghcr.io/xsmod/vanpix-rpistats2mqtt:{{ .Version }}-amd64
+      - ghcr.io/xsmod/vanpix-rpistats2mqtt:{{ .Version }}-arm64
+  - name_template: ghcr.io/xsmod/vanpix-rpistats2mqtt:latest
+    image_templates:
+      - ghcr.io/xsmod/vanpix-rpistats2mqtt:latest-amd64
+      - ghcr.io/xsmod/vanpix-rpistats2mqtt:latest-arm64
+
+release:
+  github:
+    owner: xsmod
+    name: vanpix-rpistats2mqtt
+  draft: false
+  prerelease: auto
+
+changelog:
+  use: github

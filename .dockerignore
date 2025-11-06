@@ -1,0 +1,9 @@
+# Binaries
+/rpi-stats2mqtt
+
+# IDE
+.idea
+
+# Git
+.git
+
