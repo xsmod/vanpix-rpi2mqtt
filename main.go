@@ -97,8 +97,8 @@ func loadConfig() AppConfig {
 		Broker:        env("MQTT_BROKER", "tcp://localhost:1883"),
 		User:          user,
 		Password:      pass,
-		ClientID:      env("MQTT_CLIENT_ID", "rpi-stats"),
-		Prefix:        env("MQTT_TOPIC_PREFIX", "rpi-stats"),
+		ClientID:      env("MQTT_CLIENT_ID", "vanpix_rpi"),
+		Prefix:        env("MQTT_TOPIC_PREFIX", "vanpix_rpi"),
 		IntervalSec:   intervalSec,
 		HAPrefix:      env("HA_PREFIX", "homeassistant"),
 		HostDiskPath:  env("HOST_ROOT_PATH", "/"),
@@ -196,7 +196,7 @@ func main() {
 			go func() {
 				defer wg.Done()
 				report := gatherStats()
-				publishMetrics(client, cfg.Prefix, deviceID, report)
+				publishDeviceState(client, cfg.Prefix, report)
 			}()
 		case sig := <-sigCh:
 			log.Printf("received signal %v, shutting down", sig)
@@ -216,6 +216,16 @@ func main() {
 			return
 		}
 	}
+}
+
+// publishDeviceState publishes a single JSON with all metrics to <prefix>/state.
+func publishDeviceState(client mqtt.Client, prefix string, s Stats) {
+	b, err := json.Marshal(s)
+	if err != nil {
+		log.Printf("publish %s/state failed: %v", prefix, err)
+		return
+	}
+	publish(client, fmt.Sprintf("%s/state", prefix), string(b))
 }
 
 type Stats struct {
@@ -248,63 +258,111 @@ func gatherStats() Stats {
 	}
 }
 
-// publishMetrics publishes all metrics for a single Stats snapshot under the configured prefix/device.
-func publishMetrics(client mqtt.Client, prefix, device string, s Stats) {
-	top := func(metric string) string { return fmt.Sprintf("%s/%s/%s", prefix, device, metric) }
-
-	publish(client, top("cpu_load"), fmt.Sprintf("%.1f", s.CPULoad))
-	publish(client, top("temperature_c"), fmt.Sprintf("%.2f", s.TemperatureC))
-	publish(client, top("temperature_f"), fmt.Sprintf("%.2f", s.TemperatureF))
-	publish(client, top("mem_total_mb"), fmt.Sprintf("%d", s.MemTotalMB))
-	publish(client, top("mem_available_mb"), fmt.Sprintf("%d", s.MemAvailableMB))
-	publish(client, top("mem_free_mb"), fmt.Sprintf("%d", s.MemFreeMB))
-	publish(client, top("disk_total_gb"), fmt.Sprintf("%.2f", s.DiskTotalGB))
-	publish(client, top("disk_free_gb"), fmt.Sprintf("%.2f", s.DiskFreeGB))
-	publish(client, top("uptime_days"), fmt.Sprintf("%.2f", s.UptimeDays))
-	if s.IP != "" {
-		publish(client, top("ip"), s.IP)
-	}
-}
-
 // publishDeviceDiscovery publishes a single device discovery JSON following the requested schema.
 func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier string) {
-	// Build components mapped to existing state topics
-	components := map[string]map[string]interface{}{}
-	add := func(key, name, unit, deviceClass string) {
-		m := map[string]interface{}{
-			"unique_id":   fmt.Sprintf("%s_%s", DeviceIDConst, key),
-			"name":        name,
-			"platform":    "sensor",
-			"state_topic": fmt.Sprintf("%s/%s/%s", cfg.Prefix, DeviceIDConst, key),
-			"retain":      true,
-		}
-		if unit != "" {
-			m["unit_of_measurement"] = unit
-		}
-		if deviceClass != "" {
-			m["device_class"] = deviceClass
-		}
-		components[key] = m
-	}
-	add("cpu_load", "CPU Load", "%", "")
-	add("temperature_c", "Temperature (C)", "°C", "temperature")
-	add("temperature_f", "Temperature (F)", "°F", "temperature")
-	add("mem_total_mb", "Memory Total", "MB", "data_size")
-	add("mem_available_mb", "Memory Available", "MB", "data_size")
-	add("mem_free_mb", "Memory Free", "MB", "data_size")
-	add("disk_total_gb", "Disk Total", "GB", "data_size")
-	add("disk_free_gb", "Disk Free", "GB", "data_size")
-	add("uptime_days", "Uptime Days", "d", "duration")
-	// IP (text)
-	components["ip"] = map[string]interface{}{
-		"unique_id":   fmt.Sprintf("%s_ip", DeviceIDConst),
-		"name":        "IP Address",
-		"platform":    "sensor",
-		"state_topic": fmt.Sprintf("%s/%s/ip", cfg.Prefix, DeviceIDConst),
-		"retain":      true,
-	}
-
 	availabilityTopic := fmt.Sprintf("%s/availability", cfg.Prefix)
+	stateTopic := fmt.Sprintf("%s/state", cfg.Prefix)
+
+	// Components now all read from shared JSON state_topic using value_template
+	components := map[string]map[string]interface{}{
+		"cpu_load": {
+			"unique_id":           fmt.Sprintf("%s_cpu_load", DeviceIDConst),
+			"name":                "CPU Load",
+			"platform":            "sensor",
+			"state_topic":         stateTopic,
+			"value_template":      "{{ value_json.cpu_load }}",
+			"unit_of_measurement": "%",
+			"retain":              true,
+		},
+		"temperature_c": {
+			"unique_id":           fmt.Sprintf("%s_temperature_c", DeviceIDConst),
+			"name":                "Temperature (C)",
+			"platform":            "sensor",
+			"state_topic":         stateTopic,
+			"value_template":      "{{ value_json.temperature_c }}",
+			"unit_of_measurement": "°C",
+			"device_class":        "temperature",
+			"retain":              true,
+		},
+		"temperature_f": {
+			"unique_id":           fmt.Sprintf("%s_temperature_f", DeviceIDConst),
+			"name":                "Temperature (F)",
+			"platform":            "sensor",
+			"state_topic":         stateTopic,
+			"value_template":      "{{ value_json.temperature_f }}",
+			"unit_of_measurement": "°F",
+			"device_class":        "temperature",
+			"retain":              true,
+		},
+		"mem_total_mb": {
+			"unique_id":           fmt.Sprintf("%s_mem_total_mb", DeviceIDConst),
+			"name":                "Memory Total",
+			"platform":            "sensor",
+			"state_topic":         stateTopic,
+			"value_template":      "{{ value_json.mem_total_mb }}",
+			"unit_of_measurement": "MB",
+			"device_class":        "data_size",
+			"retain":              true,
+		},
+		"mem_available_mb": {
+			"unique_id":           fmt.Sprintf("%s_mem_available_mb", DeviceIDConst),
+			"name":                "Memory Available",
+			"platform":            "sensor",
+			"state_topic":         stateTopic,
+			"value_template":      "{{ value_json.mem_available_mb }}",
+			"unit_of_measurement": "MB",
+			"device_class":        "data_size",
+			"retain":              true,
+		},
+		"mem_free_mb": {
+			"unique_id":           fmt.Sprintf("%s_mem_free_mb", DeviceIDConst),
+			"name":                "Memory Free",
+			"platform":            "sensor",
+			"state_topic":         stateTopic,
+			"value_template":      "{{ value_json.mem_free_mb }}",
+			"unit_of_measurement": "MB",
+			"device_class":        "data_size",
+			"retain":              true,
+		},
+		"disk_total_gb": {
+			"unique_id":           fmt.Sprintf("%s_disk_total_gb", DeviceIDConst),
+			"name":                "Disk Total",
+			"platform":            "sensor",
+			"state_topic":         stateTopic,
+			"value_template":      "{{ value_json.disk_total_gb }}",
+			"unit_of_measurement": "GB",
+			"device_class":        "data_size",
+			"retain":              true,
+		},
+		"disk_free_gb": {
+			"unique_id":           fmt.Sprintf("%s_disk_free_gb", DeviceIDConst),
+			"name":                "Disk Free",
+			"platform":            "sensor",
+			"state_topic":         stateTopic,
+			"value_template":      "{{ value_json.disk_free_gb }}",
+			"unit_of_measurement": "GB",
+			"device_class":        "data_size",
+			"retain":              true,
+		},
+		"uptime_days": {
+			"unique_id":           fmt.Sprintf("%s_uptime_days", DeviceIDConst),
+			"name":                "Uptime Days",
+			"platform":            "sensor",
+			"state_topic":         stateTopic,
+			"value_template":      "{{ value_json.uptime_days }}",
+			"unit_of_measurement": "d",
+			"device_class":        "duration",
+			"retain":              true,
+		},
+		"ip": {
+			"unique_id":      fmt.Sprintf("%s_ip", DeviceIDConst),
+			"name":           "IP Address",
+			"platform":       "sensor",
+			"state_topic":    stateTopic,
+			"value_template": "{{ value_json.ip }}",
+			"retain":         true,
+		},
+	}
 
 	root := map[string]interface{}{
 		"device": map[string]interface{}{
@@ -316,16 +374,17 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 		},
 		"origin":                map[string]interface{}{"name": "application"},
 		"components":            components,
-		"state_topic":           fmt.Sprintf("%s/state", cfg.Prefix),
+		"state_topic":           stateTopic,
 		"availability_topic":    availabilityTopic,
 		"payload_available":     "online",
 		"payload_not_available": "offline",
 		"qos":                   2,
 	}
 	b, _ := json.Marshal(root)
-	topic := fmt.Sprintf("%s/device/%s/config", cfg.HAPrefix, deviceIdentifier)
-	client.Publish(topic, 0, true, string(b)).Wait()
-	log.Printf("published %s", topic)
+	// Always publish under fixed device id topic to ensure consistent discovery path
+	configTopic := fmt.Sprintf("%s/device/%s/config", cfg.HAPrefix, DeviceIDConst)
+	client.Publish(configTopic, 0, true, string(b)).Wait()
+	log.Printf("published %s", configTopic)
 }
 
 // getCPUPercent computes CPU usage percent over the interval between calls using /proc/stat.
