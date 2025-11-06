@@ -18,6 +18,12 @@ import (
 
 var hostDiskPath string
 
+// Protect previous CPU counters for percent calculation across intervals
+var cpuMu sync.Mutex
+var prevCPUTotal uint64
+var prevCPUIdle uint64
+var prevCPUSet bool
+
 func env(key, def string) string {
 	v := os.Getenv(key)
 	if v == "" {
@@ -82,20 +88,22 @@ func main() {
 	opts := applyConfigToOptions(cfg)
 	client := mqtt.NewClient(opts)
 
-	// Retry connect with backoff
+	// Retry connect with backoff (silent until final failure)
 	maxAttempts := 10
+	var connected bool
+	var lastErr error
 	for i := 1; i <= maxAttempts; i++ {
 		if token := client.Connect(); token.Wait() && token.Error() == nil {
 			log.Println("connected to mqtt broker")
+			connected = true
 			break
 		} else {
-			log.Printf("mqtt connect attempt %d/%d failed: %v", i, maxAttempts, token.Error())
-			if i == maxAttempts {
-				log.Println("giving up connecting to mqtt broker, will continue and retry publishes")
-				break
-			}
+			lastErr = token.Error()
 			time.Sleep(time.Duration(i*2) * time.Second)
 		}
+	}
+	if !connected && lastErr != nil {
+		log.Printf("mqtt: failed to connect after %d attempts: %v", maxAttempts, lastErr)
 	}
 
 	deviceID := sanitize(cfg.DeviceName)
@@ -151,11 +159,12 @@ func sanitize(s string) string {
 }
 
 type Stats struct {
-	CPULoad        string  `json:"cpu_load"`
+	CPULoad        float64 `json:"cpu_load"` // percent 0-100
 	TemperatureC   float64 `json:"temperature_c"`
 	TemperatureF   float64 `json:"temperature_f"`
 	MemTotalMB     int64   `json:"mem_total_mb"`
 	MemAvailableMB int64   `json:"mem_available_mb"`
+	MemFreeMB      int64   `json:"mem_free_mb"`
 	DiskTotalGB    float64 `json:"disk_total_gb"`
 	DiskFreeGB     float64 `json:"disk_free_gb"`
 	UptimeDays     float64 `json:"uptime_days"`
@@ -166,11 +175,12 @@ func gatherStats() Stats {
 	c := getTemperature()
 	f := c*9.0/5.0 + 32.0
 	return Stats{
-		CPULoad:        getCPULoad(),
+		CPULoad:        getCPUPercent(),
 		TemperatureC:   c,
 		TemperatureF:   f,
 		MemTotalMB:     getMemTotalMB(),
 		MemAvailableMB: getMemAvailableMB(),
+		MemFreeMB:      getMemFreeMB(),
 		DiskTotalGB:    getDiskGB(hostDiskPath),
 		DiskFreeGB:     getDiskFreeGB(hostDiskPath),
 		UptimeDays:     getUptimeDays(),
@@ -178,44 +188,21 @@ func gatherStats() Stats {
 	}
 }
 
+// publishMetrics publishes all metrics for a single Stats snapshot under the configured prefix/device.
 func publishMetrics(client mqtt.Client, prefix, device string, s Stats) {
 	top := func(metric string) string { return fmt.Sprintf("%s/%s/%s", prefix, device, metric) }
 
-	publish(client, top("cpu_load"), s.CPULoad)
+	publish(client, top("cpu_load"), fmt.Sprintf("%.1f", s.CPULoad))
 	publish(client, top("temperature_c"), fmt.Sprintf("%.2f", s.TemperatureC))
 	publish(client, top("temperature_f"), fmt.Sprintf("%.2f", s.TemperatureF))
 	publish(client, top("mem_total_mb"), fmt.Sprintf("%d", s.MemTotalMB))
 	publish(client, top("mem_available_mb"), fmt.Sprintf("%d", s.MemAvailableMB))
+	publish(client, top("mem_free_mb"), fmt.Sprintf("%d", s.MemFreeMB))
 	publish(client, top("disk_total_gb"), fmt.Sprintf("%.2f", s.DiskTotalGB))
 	publish(client, top("disk_free_gb"), fmt.Sprintf("%.2f", s.DiskFreeGB))
 	publish(client, top("uptime_days"), fmt.Sprintf("%.2f", s.UptimeDays))
 	if s.IP != "" {
 		publish(client, top("ip"), s.IP)
-	}
-}
-
-// publish sends retained payload; attempts lightweight reconnect if disconnected.
-func publish(client mqtt.Client, topic, payload string) {
-	if client == nil {
-		log.Printf("mqtt client nil, cannot publish %s", topic)
-		return
-	}
-	if !client.IsConnected() {
-		if token := client.Connect(); token != nil {
-			if ok := token.WaitTimeout(2 * time.Second); !ok {
-				log.Printf("publish: reconnect timeout for %s", topic)
-			} else if token.Error() != nil {
-				log.Printf("publish: reconnect failed for %s: %v", topic, token.Error())
-			}
-		}
-	}
-	t := client.Publish(topic, 0, true, payload)
-	if ok := t.WaitTimeout(5 * time.Second); !ok {
-		log.Printf("publish %s timed out", topic)
-		return
-	}
-	if t.Error() != nil {
-		log.Printf("publish %s failed: %v", topic, t.Error())
 	}
 }
 
@@ -228,17 +215,18 @@ func publishHADiscovery(client mqtt.Client, haPrefix, prefix, deviceID, deviceNa
 	}
 
 	sensors := []sensorDef{
-		{"cpu_load", "CPU Load", "", ""},
+		{"cpu_load", "CPU Load", "%", ""},
 		{"temperature_c", "Temperature (C)", "°C", "temperature"},
 		{"temperature_f", "Temperature (F)", "°F", "temperature"},
 		{"mem_total_mb", "Memory Total", "MB", "data_size"},
 		{"mem_available_mb", "Memory Available", "MB", "data_size"},
+		{"mem_free_mb", "Memory Free", "MB", "data_size"},
 		{"disk_total_gb", "Disk Total", "GB", "data_size"},
 		{"disk_free_gb", "Disk Free", "GB", "data_size"},
-		{"uptime_days", "Uptime", "d", ""},
+		{"uptime_days", "Uptime", "d", "duration"},
 	}
 	if ip := getConfiguredIP(); ip != "" {
-		// add IP sensor non-numeric (no state_class)
+		// add IP sensor non-numeric (no unit, no device_class/state_class)
 		sensors = append(sensors, sensorDef{"ip", "IP Address", "", ""})
 	}
 
@@ -246,10 +234,9 @@ func publishHADiscovery(client mqtt.Client, haPrefix, prefix, deviceID, deviceNa
 		objectID := fmt.Sprintf("%s_%s", deviceID, s.Metric)
 		stateTopic := fmt.Sprintf("%s/%s/%s", prefix, deviceID, s.Metric)
 		cfg := map[string]interface{}{
-			"name":                fmt.Sprintf("%s %s", deviceName, s.Name),
-			"state_topic":         stateTopic,
-			"unique_id":           objectID,
-			"unit_of_measurement": s.Unit,
+			"name":        fmt.Sprintf("%s %s", deviceName, s.Name),
+			"state_topic": stateTopic,
+			"unique_id":   objectID,
 			"device": map[string]interface{}{
 				"identifiers":  []string{deviceID},
 				"name":         deviceName,
@@ -257,13 +244,20 @@ func publishHADiscovery(client mqtt.Client, haPrefix, prefix, deviceID, deviceNa
 				"manufacturer": "Raspberry Pi",
 			},
 		}
-
-		// Add device_class and state_class for better HA integration
+		if s.Unit != "" {
+			cfg["unit_of_measurement"] = s.Unit
+		}
 		if s.DeviceClass != "" {
 			cfg["device_class"] = s.DeviceClass
+		} else if isDataSizeUnit(s.Unit) {
+			cfg["device_class"] = "data_size"
 		}
-		// all remaining metrics are numeric measurements
-		cfg["state_class"] = "measurement"
+		if s.Metric != "ip" {
+			cfg["state_class"] = "measurement"
+		}
+		if s.Metric == "uptime_days" {
+			cfg["platform"] = "sensor"
+		}
 
 		b, _ := json.Marshal(cfg)
 		topic := fmt.Sprintf("%s/sensor/%s/%s/config", haPrefix, deviceID, objectID)
@@ -271,15 +265,86 @@ func publishHADiscovery(client mqtt.Client, haPrefix, prefix, deviceID, deviceNa
 	}
 }
 
-func getCPULoad() string {
-	b, err := os.ReadFile("/proc/loadavg")
-	if err != nil {
-		return ""
+// getCPUPercent computes CPU usage percent over the interval between calls using /proc/stat.
+func getCPUPercent() float64 {
+	idle, total := readCPUTimes()
+	cpuMu.Lock()
+	defer cpuMu.Unlock()
+	if !prevCPUSet {
+		prevCPUIdle, prevCPUTotal, prevCPUSet = idle, total, true
+		return 0.0
 	}
-	return parseLoadAvgFromBytes(b)
+	deltaIdle := float64(idle - prevCPUIdle)
+	deltaTotal := float64(total - prevCPUTotal)
+	prevCPUIdle, prevCPUTotal = idle, total
+	if deltaTotal <= 0 {
+		return 0.0
+	}
+	usage := (1.0 - deltaIdle/deltaTotal) * 100.0
+	if usage < 0 {
+		usage = 0
+	}
+	if usage > 100 {
+		usage = 100
+	}
+	return usage
 }
 
-// parseLoadAvgFromBytes extracts the 1-minute load average from /proc/loadavg content.
+// readCPUTimes reads the first line of /proc/stat and returns (idle, total) jiffies.
+func readCPUTimes() (idle, total uint64) {
+	b, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, 0
+	}
+	s := bufio.NewScanner(strings.NewReader(string(b)))
+	for s.Scan() {
+		line := s.Text()
+		if !strings.HasPrefix(line, "cpu ") {
+			continue
+		}
+		fields := strings.Fields(line)[1:]
+		var vals []uint64
+		for _, f := range fields {
+			v, err := strconv.ParseUint(f, 10, 64)
+			if err != nil {
+				v = 0
+			}
+			vals = append(vals, v)
+		}
+		// According to procfs, the first fields are:
+		// user nice system idle iowait irq softirq steal guest guest_nice
+		var user, nice, system, idleVal, iowait, irq, softirq, steal uint64
+		if len(vals) > 0 {
+			user = vals[0]
+		}
+		if len(vals) > 1 {
+			nice = vals[1]
+		}
+		if len(vals) > 2 {
+			system = vals[2]
+		}
+		if len(vals) > 3 {
+			idleVal = vals[3]
+		}
+		if len(vals) > 4 {
+			iowait = vals[4]
+		}
+		if len(vals) > 5 {
+			irq = vals[5]
+		}
+		if len(vals) > 6 {
+			softirq = vals[6]
+		}
+		if len(vals) > 7 {
+			steal = vals[7]
+		}
+		total := user + nice + system + idleVal + iowait + irq + softirq + steal
+		return idleVal + iowait, total
+	}
+	return 0, 0
+}
+
+// parseLoadAvgFromBytes remains for tests but is no longer used for CPU percent.
 func parseLoadAvgFromBytes(b []byte) string {
 	parts := strings.Fields(string(b))
 	if len(parts) < 1 {
@@ -325,6 +390,14 @@ func getMemAvailableMB() int64 {
 		return v / 1024
 	}
 	// Fallback to MemFree
+	if v, ok := m["MemFree"]; ok {
+		return v / 1024
+	}
+	return 0
+}
+
+func getMemFreeMB() int64 {
+	m := parseMemInfo()
 	if v, ok := m["MemFree"]; ok {
 		return v / 1024
 	}
@@ -427,4 +500,45 @@ func getConfiguredIP() string {
 		}
 	}
 	return ""
+}
+
+// publish sends a retained MQTT message to the given topic.
+// Behavior:
+// - If disconnected, it performs a short, silent reconnect attempt.
+// - On failure (timeout/error), it logs with the topic and reason.
+// - On success, it logs a clear sentence including the topic.
+func publish(client mqtt.Client, topic, payload string) {
+	if client == nil {
+		log.Printf("mqtt client nil, cannot publish %s", topic)
+		return
+	}
+	if !client.IsConnected() {
+		if token := client.Connect(); token != nil {
+			_ = token.WaitTimeout(2 * time.Second)
+		}
+	}
+	if !client.IsConnected() {
+		log.Printf("publish %s skipped: mqtt disconnected", topic)
+		return
+	}
+	t := client.Publish(topic, 0, true, payload)
+	if ok := t.WaitTimeout(5 * time.Second); !ok {
+		log.Printf("publish %s failed: timeout", topic)
+		return
+	}
+	if err := t.Error(); err != nil {
+		log.Printf("publish %s failed: %v", topic, err)
+		return
+	}
+	// Success: log a clear, human-friendly line including the topic
+	log.Printf("published %s", topic)
+}
+
+func isDataSizeUnit(u string) bool {
+	switch u {
+	case "B", "kB", "MB", "GB", "TB", "PB", "KiB", "MiB", "GiB", "TiB", "PiB":
+		return true
+	default:
+		return false
+	}
 }
