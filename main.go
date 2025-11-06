@@ -33,16 +33,17 @@ func env(key, def string) string {
 }
 
 type AppConfig struct {
-	Broker       string
-	User         string
-	Password     string
-	ClientID     string
-	Prefix       string
-	IntervalSec  int
-	DeviceName   string
-	HADiscovery  bool
-	HAPrefix     string
-	HostDiskPath string
+	Broker        string
+	User          string
+	Password      string
+	ClientID      string
+	Prefix        string
+	IntervalSec   int
+	DeviceName    string
+	HADiscovery   bool
+	HAPrefix      string
+	HostDiskPath  string
+	HAIdentifiers []string
 }
 
 func loadConfig() AppConfig {
@@ -56,18 +57,42 @@ func loadConfig() AppConfig {
 	if user == "" {
 		pass = ""
 	}
-	return AppConfig{
-		Broker:       env("MQTT_BROKER", "tcp://localhost:1883"),
-		User:         user,
-		Password:     pass,
-		ClientID:     env("MQTT_CLIENT_ID", "rpi-stats"),
-		Prefix:       env("MQTT_TOPIC_PREFIX", "rpi-stats"),
-		IntervalSec:  intervalSec,
-		DeviceName:   env("DEVICE_NAME", "rpi"),
-		HADiscovery:  strings.ToLower(env("HA_DISCOVERY", "true")) != "false",
-		HAPrefix:     env("HA_PREFIX", "homeassistant"),
-		HostDiskPath: env("HOST_ROOT_PATH", "/"),
+	// HA device identifiers: support both singular and plural envs
+	ids := env("HA_DEVICE_IDENTIFIERS", "")
+	if ids == "" {
+		ids = env("HA_DEVICE_IDENTIFIER", "")
 	}
+	return AppConfig{
+		Broker:        env("MQTT_BROKER", "tcp://localhost:1883"),
+		User:          user,
+		Password:      pass,
+		ClientID:      env("MQTT_CLIENT_ID", "rpi-stats"),
+		Prefix:        env("MQTT_TOPIC_PREFIX", "rpi-stats"),
+		IntervalSec:   intervalSec,
+		DeviceName:    env("DEVICE_NAME", "rpi"),
+		HADiscovery:   strings.ToLower(env("HA_DISCOVERY", "true")) != "false",
+		HAPrefix:      env("HA_PREFIX", "homeassistant"),
+		HostDiskPath:  env("HOST_ROOT_PATH", "/"),
+		HAIdentifiers: parseIdentifiers(ids),
+	}
+}
+
+func parseIdentifiers(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func applyConfigToOptions(cfg AppConfig) *mqtt.ClientOptions {
@@ -84,6 +109,7 @@ func applyConfigToOptions(cfg AppConfig) *mqtt.ClientOptions {
 func main() {
 	cfg := loadConfig()
 	hostDiskPath = cfg.HostDiskPath
+	// Compute device identifiers for HA (fallback to deviceID later if empty)
 
 	opts := applyConfigToOptions(cfg)
 	client := mqtt.NewClient(opts)
@@ -107,6 +133,10 @@ func main() {
 	}
 
 	deviceID := sanitize(cfg.DeviceName)
+	deviceIdentifiers := cfg.HAIdentifiers
+	if len(deviceIdentifiers) == 0 {
+		deviceIdentifiers = []string{deviceID}
+	}
 
 	var wg sync.WaitGroup
 
@@ -114,7 +144,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			publishHADiscovery(client, cfg.HAPrefix, cfg.Prefix, deviceID, cfg.DeviceName)
+			publishHADiscovery(client, cfg.HAPrefix, cfg.Prefix, deviceID, cfg.DeviceName, deviceIdentifiers)
 		}()
 	}
 
@@ -206,7 +236,7 @@ func publishMetrics(client mqtt.Client, prefix, device string, s Stats) {
 	}
 }
 
-func publishHADiscovery(client mqtt.Client, haPrefix, prefix, deviceID, deviceName string) {
+func publishHADiscovery(client mqtt.Client, haPrefix, prefix, deviceID, deviceName string, deviceIdentifiers []string) {
 	type sensorDef struct {
 		Metric      string
 		Name        string
@@ -238,7 +268,7 @@ func publishHADiscovery(client mqtt.Client, haPrefix, prefix, deviceID, deviceNa
 			"state_topic": stateTopic,
 			"unique_id":   objectID,
 			"device": map[string]interface{}{
-				"identifiers":  []string{deviceID},
+				"identifiers":  deviceIdentifiers,
 				"name":         deviceName,
 				"model":        "Raspberry Pi",
 				"manufacturer": "Raspberry Pi",
