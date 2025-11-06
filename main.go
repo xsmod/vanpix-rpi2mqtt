@@ -16,6 +16,10 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
+const (
+	DeviceIDConst = "vanpix_rpi"
+)
+
 var hostDiskPath string
 
 // Protect previous CPU counters for percent calculation across intervals
@@ -23,6 +27,13 @@ var cpuMu sync.Mutex
 var prevCPUTotal uint64
 var prevCPUIdle uint64
 var prevCPUSet bool
+
+var (
+	// BuildTag and BuildCommit can be set via -ldflags at build time:
+	//   -ldflags "-X main.BuildTag=v1.2.3 -X main.BuildCommit=abcdef1"
+	BuildTag    string
+	BuildCommit string
+)
 
 func env(key, def string) string {
 	v := os.Getenv(key)
@@ -39,11 +50,28 @@ type AppConfig struct {
 	ClientID      string
 	Prefix        string
 	IntervalSec   int
-	DeviceName    string
-	HADiscovery   bool
 	HAPrefix      string
 	HostDiskPath  string
 	HAIdentifiers []string
+	SWVersion     string
+	HADiscovery   bool
+}
+
+func getSWVersion() string {
+	// Allow explicit override via APP_VERSION for special cases
+	if v := os.Getenv("APP_VERSION"); v != "" {
+		return v
+	}
+	if BuildTag != "" {
+		return BuildTag
+	}
+	if BuildCommit != "" {
+		if len(BuildCommit) >= 7 {
+			return BuildCommit[:7]
+		}
+		return BuildCommit
+	}
+	return "dev"
 }
 
 func loadConfig() AppConfig {
@@ -62,6 +90,9 @@ func loadConfig() AppConfig {
 	if ids == "" {
 		ids = env("HA_DEVICE_IDENTIFIER", "")
 	}
+	// discovery toggle (default true)
+	haDisc := strings.ToLower(env("HA_DISCOVERY", "true")) != "false"
+	sw := getSWVersion()
 	return AppConfig{
 		Broker:        env("MQTT_BROKER", "tcp://localhost:1883"),
 		User:          user,
@@ -69,11 +100,11 @@ func loadConfig() AppConfig {
 		ClientID:      env("MQTT_CLIENT_ID", "rpi-stats"),
 		Prefix:        env("MQTT_TOPIC_PREFIX", "rpi-stats"),
 		IntervalSec:   intervalSec,
-		DeviceName:    env("DEVICE_NAME", "rpi"),
-		HADiscovery:   strings.ToLower(env("HA_DISCOVERY", "true")) != "false",
 		HAPrefix:      env("HA_PREFIX", "homeassistant"),
 		HostDiskPath:  env("HOST_ROOT_PATH", "/"),
 		HAIdentifiers: parseIdentifiers(ids),
+		SWVersion:     sw,
+		HADiscovery:   haDisc,
 	}
 }
 
@@ -109,9 +140,19 @@ func applyConfigToOptions(cfg AppConfig) *mqtt.ClientOptions {
 func main() {
 	cfg := loadConfig()
 	hostDiskPath = cfg.HostDiskPath
-	// Compute device identifiers for HA (fallback to deviceID later if empty)
+	deviceID := DeviceIDConst
+	deviceIdentifiers := cfg.HAIdentifiers
+	if len(deviceIdentifiers) == 0 {
+		deviceIdentifiers = []string{deviceID}
+	}
+
+	availabilityTopic := fmt.Sprintf("%s/availability", cfg.Prefix)
+
+	var wg sync.WaitGroup
 
 	opts := applyConfigToOptions(cfg)
+	// Set MQTT Last Will to offline so broker marks availability on ungraceful exit
+	opts.SetWill(availabilityTopic, "offline", 0, true)
 	client := mqtt.NewClient(opts)
 
 	// Retry connect with backoff (silent until final failure)
@@ -132,20 +173,13 @@ func main() {
 		log.Printf("mqtt: failed to connect after %d attempts: %v", maxAttempts, lastErr)
 	}
 
-	deviceID := sanitize(cfg.DeviceName)
-	deviceIdentifiers := cfg.HAIdentifiers
-	if len(deviceIdentifiers) == 0 {
-		deviceIdentifiers = []string{deviceID}
+	if connected {
+		// Mark device online
+		publish(client, availabilityTopic, "online")
 	}
 
-	var wg sync.WaitGroup
-
-	if cfg.HADiscovery {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			publishHADiscovery(client, cfg.HAPrefix, cfg.Prefix, deviceID, cfg.DeviceName, deviceIdentifiers)
-		}()
+	if connected && cfg.HADiscovery {
+		publishDeviceDiscovery(client, cfg, deviceIdentifiers[0])
 	}
 
 	ticker := time.NewTicker(time.Duration(cfg.IntervalSec) * time.Second)
@@ -174,18 +208,14 @@ func main() {
 			case <-time.After(3 * time.Second):
 				log.Println("timeout waiting for in-flight publishes")
 			}
+			// Mark device offline
+			publish(client, availabilityTopic, "offline")
 			if client != nil && client.IsConnected() {
 				client.Disconnect(250)
 			}
 			return
 		}
 	}
-}
-
-func sanitize(s string) string {
-	s = strings.ToLower(s)
-	s = strings.ReplaceAll(s, " ", "_")
-	return s
 }
 
 type Stats struct {
@@ -236,63 +266,66 @@ func publishMetrics(client mqtt.Client, prefix, device string, s Stats) {
 	}
 }
 
-func publishHADiscovery(client mqtt.Client, haPrefix, prefix, deviceID, deviceName string, deviceIdentifiers []string) {
-	type sensorDef struct {
-		Metric      string
-		Name        string
-		Unit        string
-		DeviceClass string
+// publishDeviceDiscovery publishes a single device discovery JSON following the requested schema.
+func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier string) {
+	// Build components mapped to existing state topics
+	components := map[string]map[string]interface{}{}
+	add := func(key, name, unit, deviceClass string) {
+		m := map[string]interface{}{
+			"unique_id":   fmt.Sprintf("%s_%s", DeviceIDConst, key),
+			"name":        name,
+			"platform":    "sensor",
+			"state_topic": fmt.Sprintf("%s/%s/%s", cfg.Prefix, DeviceIDConst, key),
+			"retain":      true,
+		}
+		if unit != "" {
+			m["unit_of_measurement"] = unit
+		}
+		if deviceClass != "" {
+			m["device_class"] = deviceClass
+		}
+		components[key] = m
+	}
+	add("cpu_load", "CPU Load", "%", "")
+	add("temperature_c", "Temperature (C)", "°C", "temperature")
+	add("temperature_f", "Temperature (F)", "°F", "temperature")
+	add("mem_total_mb", "Memory Total", "MB", "data_size")
+	add("mem_available_mb", "Memory Available", "MB", "data_size")
+	add("mem_free_mb", "Memory Free", "MB", "data_size")
+	add("disk_total_gb", "Disk Total", "GB", "data_size")
+	add("disk_free_gb", "Disk Free", "GB", "data_size")
+	add("uptime_days", "Uptime Days", "d", "duration")
+	// IP (text)
+	components["ip"] = map[string]interface{}{
+		"unique_id":   fmt.Sprintf("%s_ip", DeviceIDConst),
+		"name":        "IP Address",
+		"platform":    "sensor",
+		"state_topic": fmt.Sprintf("%s/%s/ip", cfg.Prefix, DeviceIDConst),
+		"retain":      true,
 	}
 
-	sensors := []sensorDef{
-		{"cpu_load", "CPU Load", "%", ""},
-		{"temperature_c", "Temperature (C)", "°C", "temperature"},
-		{"temperature_f", "Temperature (F)", "°F", "temperature"},
-		{"mem_total_mb", "Memory Total", "MB", "data_size"},
-		{"mem_available_mb", "Memory Available", "MB", "data_size"},
-		{"mem_free_mb", "Memory Free", "MB", "data_size"},
-		{"disk_total_gb", "Disk Total", "GB", "data_size"},
-		{"disk_free_gb", "Disk Free", "GB", "data_size"},
-		{"uptime_days", "Uptime", "d", "duration"},
-	}
-	if ip := getConfiguredIP(); ip != "" {
-		// add IP sensor non-numeric (no unit, no device_class/state_class)
-		sensors = append(sensors, sensorDef{"ip", "IP Address", "", ""})
-	}
+	availabilityTopic := fmt.Sprintf("%s/availability", cfg.Prefix)
 
-	for _, s := range sensors {
-		objectID := fmt.Sprintf("%s_%s", deviceID, s.Metric)
-		stateTopic := fmt.Sprintf("%s/%s/%s", prefix, deviceID, s.Metric)
-		cfg := map[string]interface{}{
-			"name":        fmt.Sprintf("%s %s", deviceName, s.Name),
-			"state_topic": stateTopic,
-			"unique_id":   objectID,
-			"device": map[string]interface{}{
-				"identifiers":  deviceIdentifiers,
-				"name":         deviceName,
-				"model":        "Raspberry Pi",
-				"manufacturer": "Raspberry Pi",
-			},
-		}
-		if s.Unit != "" {
-			cfg["unit_of_measurement"] = s.Unit
-		}
-		if s.DeviceClass != "" {
-			cfg["device_class"] = s.DeviceClass
-		} else if isDataSizeUnit(s.Unit) {
-			cfg["device_class"] = "data_size"
-		}
-		if s.Metric != "ip" {
-			cfg["state_class"] = "measurement"
-		}
-		if s.Metric == "uptime_days" {
-			cfg["platform"] = "sensor"
-		}
-
-		b, _ := json.Marshal(cfg)
-		topic := fmt.Sprintf("%s/sensor/%s/%s/config", haPrefix, deviceID, objectID)
-		client.Publish(topic, 0, true, string(b)).Wait()
+	root := map[string]interface{}{
+		"device": map[string]interface{}{
+			"ids":          deviceIdentifier,
+			"name":         "VanPIX- RPI",
+			"manufacturer": "github.com/xsmod",
+			"model":        "vanpix-rpistats2mqtt",
+			"sw":           cfg.SWVersion,
+		},
+		"origin":                map[string]interface{}{"name": "application"},
+		"components":            components,
+		"state_topic":           fmt.Sprintf("%s/state", cfg.Prefix),
+		"availability_topic":    availabilityTopic,
+		"payload_available":     "online",
+		"payload_not_available": "offline",
+		"qos":                   2,
 	}
+	b, _ := json.Marshal(root)
+	topic := fmt.Sprintf("%s/device/%s/config", cfg.HAPrefix, deviceIdentifier)
+	client.Publish(topic, 0, true, string(b)).Wait()
+	log.Printf("published %s", topic)
 }
 
 // getCPUPercent computes CPU usage percent over the interval between calls using /proc/stat.
@@ -562,13 +595,4 @@ func publish(client mqtt.Client, topic, payload string) {
 	}
 	// Success: log a clear, human-friendly line including the topic
 	log.Printf("published %s", topic)
-}
-
-func isDataSizeUnit(u string) bool {
-	switch u {
-	case "B", "kB", "MB", "GB", "TB", "PB", "KiB", "MiB", "GiB", "TiB", "PiB":
-		return true
-	default:
-		return false
-	}
 }
