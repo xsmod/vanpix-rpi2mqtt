@@ -266,6 +266,8 @@ type Stats struct {
 
 func gatherStats() Stats {
 	c := getTemperature()
+	// Ensure temperature is an integer value (no decimals) for Home Assistant
+	c = math.Round(c)
 	ud := getUptimeDays()
 	ud = math.Round(ud*100) / 100 // round to 2 decimals for JSON output
 	cp := getCPUPercent()
@@ -295,7 +297,6 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 
 	components := map[string]map[string]interface{}{
 		"cpu_load": {
-			"unique_id":           fmt.Sprintf("%s_cpu_load", DeviceIDConst),
 			"name":                "CPU Load",
 			"platform":            "sensor",
 			"state_topic":         stateTopic,
@@ -306,18 +307,17 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			"entity_category":     "diagnostic",
 		},
 		"temperature": {
-			"unique_id":       fmt.Sprintf("%s_temperature", DeviceIDConst),
-			"name":            "Temperature",
-			"platform":        "sensor",
-			"state_topic":     stateTopic,
-			"value_template":  "{{ value_json.temperature }}",
-			"device_class":    "temperature",
-			"retain":          true,
-			"state_class":     "measurement",
-			"entity_category": "diagnostic",
+			"name":                "Temperature",
+			"platform":            "sensor",
+			"state_topic":         stateTopic,
+			"value_template":      "{{ value_json.temperature }}",
+			"device_class":        "temperature",
+			"unit_of_measurement": "°C",
+			"retain":              true,
+			"state_class":         "measurement",
+			"entity_category":     "diagnostic",
 		},
 		"mem_total_mb": {
-			"unique_id":           fmt.Sprintf("%s_mem_total_mb", DeviceIDConst),
 			"name":                "Memory Total",
 			"platform":            "sensor",
 			"state_topic":         stateTopic,
@@ -329,7 +329,6 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			"entity_category":     "diagnostic",
 		},
 		"mem_available_mb": {
-			"unique_id":           fmt.Sprintf("%s_mem_available_mb", DeviceIDConst),
 			"name":                "Memory Available",
 			"platform":            "sensor",
 			"state_topic":         stateTopic,
@@ -341,7 +340,6 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			"entity_category":     "diagnostic",
 		},
 		"mem_free_mb": {
-			"unique_id":           fmt.Sprintf("%s_mem_free_mb", DeviceIDConst),
 			"name":                "Memory Free",
 			"platform":            "sensor",
 			"state_topic":         stateTopic,
@@ -353,7 +351,6 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			"entity_category":     "diagnostic",
 		},
 		"disk_total_gb": {
-			"unique_id":           fmt.Sprintf("%s_disk_total_gb", DeviceIDConst),
 			"name":                "Disk Total",
 			"platform":            "sensor",
 			"state_topic":         stateTopic,
@@ -365,7 +362,6 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			"entity_category":     "diagnostic",
 		},
 		"disk_free_gb": {
-			"unique_id":           fmt.Sprintf("%s_disk_free_gb", DeviceIDConst),
 			"name":                "Disk Free",
 			"platform":            "sensor",
 			"state_topic":         stateTopic,
@@ -377,7 +373,6 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			"entity_category":     "diagnostic",
 		},
 		"uptime_days": {
-			"unique_id":           fmt.Sprintf("%s_uptime_days", DeviceIDConst),
 			"name":                "Uptime Days",
 			"platform":            "sensor",
 			"state_topic":         stateTopic,
@@ -389,7 +384,6 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			"entity_category":     "diagnostic",
 		},
 		"ip": {
-			"unique_id":       fmt.Sprintf("%s_ip", DeviceIDConst),
 			"name":            "IP Address",
 			"platform":        "sensor",
 			"state_topic":     stateTopic,
@@ -399,9 +393,16 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 		},
 	}
 
-	// Deterministic structs (device only has ids now)
+	// Determine device identifiers: prefer configured HA identifiers, otherwise use the provided deviceIdentifier
+	identifiers := cfg.HAIdentifiers
+	if len(identifiers) == 0 {
+		identifiers = []string{deviceIdentifier}
+	}
+
+	// Deterministic structs (device now exposes identifiers array)
 	type discoveryDevice struct {
-		IDs string `json:"ids"`
+		Identifiers []string `json:"identifiers"`
+		Name        string   `json:"name,omitempty"`
 	}
 	type discoveryRoot struct {
 		Device              discoveryDevice                   `json:"device"`
@@ -416,7 +417,8 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 
 	root := discoveryRoot{
 		Device: discoveryDevice{
-			IDs: deviceIdentifier,
+			Identifiers: identifiers,
+			Name:        DeviceIDConst,
 		},
 		Origin:              map[string]string{"name": "vanpix-rpi2mqtt", "sw_version": cfg.SWVersion, "url": "https://github.com/xsmod/vanpix-rpi2mqtt"},
 		Components:          components,

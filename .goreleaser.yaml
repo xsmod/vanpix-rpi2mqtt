@@ -23,20 +23,20 @@ builds:
       - -s -w -X main.BuildTag={{ .Version }} -X main.BuildCommit={{ .FullCommit }}
 
 dockers:
-#  - id: image-amd64
-#    use: buildx
-#    goos: linux
-#    goarch: amd64
-#    dockerfile: Dockerfile
-#    image_templates:
-#      - ghcr.io/xsmod/vanpix-rpi2mqtt:{{ .Version }}-amd64
-#      - ghcr.io/xsmod/vanpix-rpi2mqtt:latest-amd64
-#    build_flag_templates:
-#      - --platform=linux/amd64
-#      - --build-arg=TARGETOS=linux
-#      - --build-arg=TARGETARCH=amd64
-#      - --build-arg=VERSION={{ .Version }}
-#      - --build-arg=VCS_REF={{ .FullCommit }}
+  - id: image-amd64
+    use: buildx
+    goos: linux
+    goarch: amd64
+    dockerfile: Dockerfile
+    image_templates:
+      - ghcr.io/xsmod/vanpix-rpi2mqtt:{{ .Version }}-amd64
+      - ghcr.io/xsmod/vanpix-rpi2mqtt:latest-amd64
+    build_flag_templates:
+      - --platform=linux/amd64
+      - --build-arg=TARGETOS=linux
+      - --build-arg=TARGETARCH=amd64
+      - --build-arg=VERSION={{ .Version }}
+      - --build-arg=VCS_REF={{ .FullCommit }}
   - id: image-arm64
     use: buildx
     goos: linux
@@ -55,11 +55,11 @@ dockers:
 docker_manifests:
   - name_template: ghcr.io/xsmod/vanpix-rpi2mqtt:{{ .Version }}
     image_templates:
-#      - ghcr.io/xsmod/vanpix-rpi2mqtt:{{ .Version }}-amd64
+      - ghcr.io/xsmod/vanpix-rpi2mqtt:{{ .Version }}-amd64
       - ghcr.io/xsmod/vanpix-rpi2mqtt:{{ .Version }}-arm64
   - name_template: ghcr.io/xsmod/vanpix-rpi2mqtt:latest
     image_templates:
-#      - ghcr.io/xsmod/vanpix-rpi2mqtt:latest-amd64
+      - ghcr.io/xsmod/vanpix-rpi2mqtt:latest-amd64
       - ghcr.io/xsmod/vanpix-rpi2mqtt:latest-arm64
 
 release:
