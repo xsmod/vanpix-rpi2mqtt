@@ -390,16 +390,34 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 		},
 	}
 
-	// Determine device identifiers: prefer configured HA identifiers, otherwise use the provided deviceIdentifier
-	identifiers := cfg.HAIdentifiers
-	if len(identifiers) == 0 {
-		identifiers = []string{deviceIdentifier}
+	// Determine device identifiers: always include DeviceIDConst first, then configured HA identifiers (deduplicated)
+	identMap := map[string]bool{}
+	identifiers := make([]string, 0, 1+len(cfg.HAIdentifiers))
+	addIdent := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if !identMap[id] {
+			identMap[id] = true
+			identifiers = append(identifiers, id)
+		}
 	}
+	// DeviceIDConst must always be present first
+	addIdent(DeviceIDConst)
+	// then add env-provided identifiers in order
+	for _, id := range cfg.HAIdentifiers {
+		addIdent(id)
+	}
+	// include provided deviceIdentifier if it wasn't in the list
+	addIdent(deviceIdentifier)
 
-	// Deterministic structs (device now exposes identifiers array)
+	// Deterministic structs (device now exposes identifiers array and optional metadata)
 	type discoveryDevice struct {
-		Identifiers []string `json:"identifiers"`
-		Name        string   `json:"name,omitempty"`
+		Identifiers  []string `json:"identifiers"`
+		Name         string   `json:"name,omitempty"`
+		Manufacturer string   `json:"manufacturer,omitempty"`
+		Model        string   `json:"model,omitempty"`
 	}
 	type discoveryRoot struct {
 		Device              discoveryDevice                   `json:"device"`
@@ -412,11 +430,16 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 		QOS                 int                               `json:"qos"`
 	}
 
+	dev := discoveryDevice{Identifiers: identifiers}
+	// If no env-provided identifiers were configured, include friendly device metadata
+	if len(cfg.HAIdentifiers) == 0 {
+		dev.Name = "VanPIX RPI"
+		dev.Manufacturer = "github.com/xsmod"
+		dev.Model = "vanpix-rpi2mqtt"
+	}
+
 	root := discoveryRoot{
-		Device: discoveryDevice{
-			Identifiers: identifiers,
-			Name:        DeviceIDConst,
-		},
+		Device:              dev,
 		Origin:              map[string]string{"name": "vanpix-rpi2mqtt", "sw_version": cfg.SWVersion, "url": "https://github.com/xsmod/vanpix-rpi2mqtt"},
 		Components:          components,
 		StateTopic:          stateTopic,
