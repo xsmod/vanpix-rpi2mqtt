@@ -40,6 +40,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/xsmod/vanpix-rpi2mqtt:${{ steps.vars.outputs.version }}
+            ghcr.io/xsmod/vanpix-rpi2mqtt:latest
           build-args: |
             VERSION=${{ steps.vars.outputs.version }}
-            VCS_REF=${{ github.sha }}
+            VCS_REF={{ github.sha }}

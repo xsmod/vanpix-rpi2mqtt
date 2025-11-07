@@ -275,7 +275,6 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 	availabilityTopic := fmt.Sprintf("%s/availability", cfg.Prefix)
 	stateTopic := fmt.Sprintf("%s/state", cfg.Prefix)
 
-	// Components now all read from shared JSON state_topic using value_template
 	components := map[string]map[string]interface{}{
 		"cpu_load": {
 			"unique_id":           fmt.Sprintf("%s_cpu_load", DeviceIDConst),
@@ -372,30 +371,42 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			"entity_category":     "diagnostic",
 		},
 		"ip": {
-			"unique_id":      fmt.Sprintf("%s_ip", DeviceIDConst),
-			"name":           "IP Address",
-			"platform":       "sensor",
-			"state_topic":    stateTopic,
-			"value_template": "{{ value_json.ip }}",
-			"retain":         true,
+			"unique_id":       fmt.Sprintf("%s_ip", DeviceIDConst),
+			"name":            "IP Address",
+			"platform":        "sensor",
+			"state_topic":     stateTopic,
+			"value_template":  "{{ value_json.ip }}",
+			"retain":          true,
+			"entity_category": "diagnostic",
 		},
 	}
 
-	root := map[string]interface{}{
-		"device": map[string]interface{}{
-			"ids":          deviceIdentifier,
-			"name":         "VanPIX- RPI",
-			"manufacturer": "github.com/xsmod",
-			"model":        "vanpix-rpi2mqtt",
-			"sw":           cfg.SWVersion,
+	// Deterministic structs (device only has ids now)
+	type discoveryDevice struct {
+		IDs string `json:"ids"`
+	}
+	type discoveryRoot struct {
+		Device              discoveryDevice                   `json:"device"`
+		Origin              map[string]string                 `json:"origin"`
+		Components          map[string]map[string]interface{} `json:"components"`
+		StateTopic          string                            `json:"state_topic"`
+		AvailabilityTopic   string                            `json:"availability_topic"`
+		PayloadAvailable    string                            `json:"payload_available"`
+		PayloadNotAvailable string                            `json:"payload_not_available"`
+		QOS                 int                               `json:"qos"`
+	}
+
+	root := discoveryRoot{
+		Device: discoveryDevice{
+			IDs: deviceIdentifier,
 		},
-		"origin":                map[string]interface{}{"name": "application"},
-		"components":            components,
-		"state_topic":           stateTopic,
-		"availability_topic":    availabilityTopic,
-		"payload_available":     "online",
-		"payload_not_available": "offline",
-		"qos":                   2,
+		Origin:              map[string]string{"name": "vanpix-rpi2mqtt", "sw_version": cfg.SWVersion, "url": "https://github.com/xsmod/vanpix-rpi2mqtt"},
+		Components:          components,
+		StateTopic:          stateTopic,
+		AvailabilityTopic:   availabilityTopic,
+		PayloadAvailable:    "online",
+		PayloadNotAvailable: "offline",
+		QOS:                 2,
 	}
 	b, _ := json.Marshal(root)
 	// Always publish under fixed device id topic to ensure consistent discovery path
