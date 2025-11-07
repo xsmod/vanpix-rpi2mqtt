@@ -369,7 +369,7 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			"ids":          deviceIdentifier,
 			"name":         "VanPIX- RPI",
 			"manufacturer": "github.com/xsmod",
-			"model":        "vanpix-rpistats2mqtt",
+			"model":        "vanpix-rpi2mqtt",
 			"sw":           cfg.SWVersion,
 		},
 		"origin":                map[string]interface{}{"name": "application"},

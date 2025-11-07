@@ -1,4 +1,4 @@
-module rpi-stats2mqtt
+module github.com/xsmod/vanpix-rpi2mqtt
 
 go 1.25
 

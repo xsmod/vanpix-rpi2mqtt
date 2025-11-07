@@ -1,9 +1,8 @@
 # Binaries
-/rpi-stats2mqtt
+/vanpix-rpi2mqtt
 
 # IDE
 .idea
 
 # Git
 .git
-
