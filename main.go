@@ -13,6 +13,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
@@ -285,17 +286,29 @@ func gatherStats() Stats {
 	}
 }
 
-// publishDeviceDiscovery publishes a single device discovery JSON following the requested schema.
+// sanitizeObjectID lowercases and replaces non-alphanumeric (except underscore) with underscores.
+// Use this when generating HA object_id / unique_id to ensure valid, stable names.
+func sanitizeObjectID(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+			return unicode.ToLower(r)
+		}
+		return '_'
+	}, s)
+}
+
+// publishDeviceDiscovery publishes one discovery config per sensor (component) using the
+// Home Assistant component discovery format: <HA_PREFIX>/<component>/<object_id>/config.
 func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier string) {
 	// Use normalized prefix inside discovery as well
 	basePrefix := normalizePrefix(cfg.Prefix, DeviceIDConst)
 	availabilityTopic := fmt.Sprintf("%s/availability", basePrefix)
 	stateTopic := fmt.Sprintf("%s/state", basePrefix)
 
+	// Per-sensor templates (keys are the logical keys used in the state JSON)
 	components := map[string]map[string]interface{}{
 		"cpu_load": {
 			"name":                "CPU Load",
-			"platform":            "sensor",
 			"state_topic":         stateTopic,
 			"value_template":      "{{ value_json.cpu_load }}",
 			"unit_of_measurement": "%",
@@ -305,7 +318,6 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 		},
 		"temperature": {
 			"name":                "Temperature",
-			"platform":            "sensor",
 			"state_topic":         stateTopic,
 			"value_template":      "{{ value_json.temperature }}",
 			"device_class":        "temperature",
@@ -316,7 +328,6 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 		},
 		"mem_total_mb": {
 			"name":                "Memory Total",
-			"platform":            "sensor",
 			"state_topic":         stateTopic,
 			"value_template":      "{{ value_json.mem_total_mb }}",
 			"unit_of_measurement": "MB",
@@ -327,7 +338,6 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 		},
 		"mem_available_mb": {
 			"name":                "Memory Available",
-			"platform":            "sensor",
 			"state_topic":         stateTopic,
 			"value_template":      "{{ value_json.mem_available_mb }}",
 			"unit_of_measurement": "MB",
@@ -338,7 +348,6 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 		},
 		"mem_free_mb": {
 			"name":                "Memory Free",
-			"platform":            "sensor",
 			"state_topic":         stateTopic,
 			"value_template":      "{{ value_json.mem_free_mb }}",
 			"unit_of_measurement": "MB",
@@ -349,7 +358,6 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 		},
 		"disk_total_gb": {
 			"name":                "Disk Total",
-			"platform":            "sensor",
 			"state_topic":         stateTopic,
 			"value_template":      "{{ value_json.disk_total_gb }}",
 			"unit_of_measurement": "GB",
@@ -360,7 +368,6 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 		},
 		"disk_free_gb": {
 			"name":                "Disk Free",
-			"platform":            "sensor",
 			"state_topic":         stateTopic,
 			"value_template":      "{{ value_json.disk_free_gb }}",
 			"unit_of_measurement": "GB",
@@ -371,7 +378,6 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 		},
 		"uptime_days": {
 			"name":                "Uptime Days",
-			"platform":            "sensor",
 			"state_topic":         stateTopic,
 			"value_template":      "{{ value_json.uptime_days }}",
 			"unit_of_measurement": "d",
@@ -382,15 +388,13 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 		},
 		"ip": {
 			"name":            "IP Address",
-			"platform":        "sensor",
 			"state_topic":     stateTopic,
-			"value_template":  "{{ value_json.ip }}",
 			"retain":          true,
 			"entity_category": "diagnostic",
 		},
 	}
 
-	// Determine device identifiers: always include DeviceIDConst first, then configured HA identifiers (deduplicated)
+	// Build identifiers list: DeviceIDConst first, then env-provided identifiers (deduped), then the passed deviceIdentifier if new.
 	identMap := map[string]bool{}
 	identifiers := make([]string, 0, 1+len(cfg.HAIdentifiers))
 	addIdent := func(id string) {
@@ -403,56 +407,50 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			identifiers = append(identifiers, id)
 		}
 	}
-	// DeviceIDConst must always be present first
 	addIdent(DeviceIDConst)
-	// then add env-provided identifiers in order
 	for _, id := range cfg.HAIdentifiers {
 		addIdent(id)
 	}
-	// include provided deviceIdentifier if it wasn't in the list
 	addIdent(deviceIdentifier)
 
-	// Deterministic structs (device now exposes identifiers array and optional metadata)
-	type discoveryDevice struct {
-		Identifiers  []string `json:"identifiers"`
-		Name         string   `json:"name,omitempty"`
-		Manufacturer string   `json:"manufacturer,omitempty"`
-		Model        string   `json:"model,omitempty"`
+	// Device object to inject into each entity config
+	deviceObj := map[string]interface{}{
+		"identifiers": identifiers,
 	}
-	type discoveryRoot struct {
-		Device              discoveryDevice                   `json:"device"`
-		Origin              map[string]string                 `json:"origin"`
-		Components          map[string]map[string]interface{} `json:"components"`
-		StateTopic          string                            `json:"state_topic"`
-		AvailabilityTopic   string                            `json:"availability_topic"`
-		PayloadAvailable    string                            `json:"payload_available"`
-		PayloadNotAvailable string                            `json:"payload_not_available"`
-		QOS                 int                               `json:"qos"`
-	}
-
-	dev := discoveryDevice{Identifiers: identifiers}
-	// If no env-provided identifiers were configured, include friendly device metadata
 	if len(cfg.HAIdentifiers) == 0 {
-		dev.Name = "VanPIX RPI"
-		dev.Manufacturer = "github.com/xsmod"
-		dev.Model = "vanpix-rpi2mqtt"
+		deviceObj["name"] = "VanPIX RPI"
+		deviceObj["manufacturer"] = "github.com/xsmod"
+		deviceObj["model"] = "vanpix-rpi2mqtt"
 	}
 
-	root := discoveryRoot{
-		Device:              dev,
-		Origin:              map[string]string{"name": "vanpix-rpi2mqtt", "sw_version": cfg.SWVersion, "url": "https://github.com/xsmod/vanpix-rpi2mqtt"},
-		Components:          components,
-		StateTopic:          stateTopic,
-		AvailabilityTopic:   availabilityTopic,
-		PayloadAvailable:    "online",
-		PayloadNotAvailable: "offline",
-		QOS:                 2,
+	// Publish one discovery config per component under homeassistant/<component>/<object_id>/config
+	for key, tmpl := range components {
+		// copy template to avoid mutating original
+		m := map[string]interface{}{}
+		for k, v := range tmpl {
+			m[k] = v
+		}
+
+		// inject device and availability fields
+		m["device"] = deviceObj
+		m["availability_topic"] = availabilityTopic
+		m["payload_available"] = "online"
+		m["payload_not_available"] = "offline"
+		m["qos"] = 2
+		m["retain"] = true
+
+		// determine object id and unique id
+		objectID := sanitizeObjectID(fmt.Sprintf("%s_%s", DeviceIDConst, key))
+		m["unique_id"] = objectID
+
+		// component type for discovery topic — we are publishing sensors
+		componentType := "sensor"
+
+		payload, _ := json.Marshal(m)
+		topic := fmt.Sprintf("%s/%s/%s/config", cfg.HAPrefix, componentType, objectID)
+		client.Publish(topic, 0, true, string(payload)).Wait()
+		log.Printf("published %s", topic)
 	}
-	b, _ := json.Marshal(root)
-	// Always publish under fixed device id topic to ensure consistent discovery path
-	configTopic := fmt.Sprintf("%s/device/%s/config", cfg.HAPrefix, DeviceIDConst)
-	client.Publish(configTopic, 0, true, string(b)).Wait()
-	log.Printf("published %s", configTopic)
 }
 
 // getCPUPercent computes CPU usage percent over the interval between calls using /proc/stat.
