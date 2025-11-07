@@ -5,20 +5,19 @@ Raspberry Pi host statistics -> MQTT + aggregated Home Assistant (HA) discovery.
 Current behavior (v2+):
 - One retained JSON payload with all metrics is published every interval at: `<MQTT_TOPIC_PREFIX>/state`.
 - Availability (online/offline) is retained at: `<MQTT_TOPIC_PREFIX>/availability` (MQTT Last Will offline on crash).
-- Optional HA discovery (single device document) published once at: `homeassistant/device/vanpix_rpi/config` when `HA_DISCOVERY=true`.
+- Optional HA discovery (single device document) published on every successful (re)connect at: `homeassistant/device/vanpix_rpi/config` when `HA_DISCOVERY=true` (retained, so HA always gets latest).
 - HA entities read fields from the shared JSON using `value_template` (no per-sensor state topics).
 
 Example state JSON:
 ```json
 {
-  "cpu_load": 3.1,
-  "temperature_c": 46.875,
-  "temperature_f": 116.38,
+  "cpu_load": 3.14,
+  "temperature": 46.9,
   "mem_total_mb": 8064,
   "mem_available_mb": 6393,
   "mem_free_mb": 1422,
-  "disk_total_gb": 58.24,
-  "disk_free_gb": 41.73,
+  "disk_total_gb": 58,
+  "disk_free_gb": 41,
   "uptime_days": 17.91,
   "ip": "192.168.68.250"
 }
@@ -36,8 +35,8 @@ HA discovery document (abridged):
   },
   "origin": { "name": "application" },
   "components": {
-    "cpu_load": { "platform": "sensor", "state_topic": "vanpix_rpi/state", "value_template": "{{ value_json.cpu_load }}", "unit_of_measurement": "%" },
-    "temperature_c": { "platform": "sensor", "state_topic": "vanpix_rpi/state", "value_template": "{{ value_json.temperature_c }}", "unit_of_measurement": "°C", "device_class": "temperature" }
+    "cpu_load": { "platform": "sensor", "state_topic": "vanpix_rpi/state", "value_template": "{{ value_json.cpu_load }}", "unit_of_measurement": "%", "state_class": "measurement", "entity_category": "diagnostic" },
+    "temperature": { "platform": "sensor", "state_topic": "vanpix_rpi/state", "value_template": "{{ value_json.temperature }}", "device_class": "temperature", "state_class": "measurement", "entity_category": "diagnostic" }
   },
   "state_topic": "vanpix_rpi/state",
   "availability_topic": "vanpix_rpi/availability",
@@ -49,76 +48,62 @@ HA discovery document (abridged):
 Discovery topic path is fixed to the constant device ID: `homeassistant/device/vanpix_rpi/config`.
 
 ## Metrics
-| Field | Description | Notes |
-|-------|-------------|-------|
-| cpu_load | CPU usage % over the last interval | First sample is 0.0 (baseline). Clamped 0–100. |
-| temperature_c / temperature_f | CPU / SoC temperature (°C / °F) | Reads `/sys/class/thermal/thermal_zone0/temp`. Millidegrees auto-scaled. |
-| mem_total_mb | Total RAM (from MemTotal) | From `/proc/meminfo` in MB. |
-| mem_available_mb | Available RAM (MemAvailable or MemFree fallback) | Matches `available` column in `top`. |
-| mem_free_mb | Free RAM (MemFree) | Raw free list. |
-| disk_total_gb / disk_free_gb | Host filesystem size & free (GB) | Uses `statfs` on `HOST_ROOT_PATH` (default `/`). |
-| uptime_days | Uptime in days with 2 decimals | Derived from `/proc/uptime`. |
-| ip | Provided IP string | Only published if set via env or file. |
+- cpu_load: CPU usage % over the last interval (2 decimals). First sample 0.0. Clamped 0–100.
+- temperature: SoC temperature in °C.
+- mem_total_mb / mem_available_mb / mem_free_mb: Memory stats in MB.
+- disk_total_gb / disk_free_gb: Whole GB values (floored) of host filesystem.
+- uptime_days: Uptime in days (2 decimals).
+- ip: Provided IP string (env/file).
 
 ## Environment Variables
-| Name | Default | Purpose |
-|------|---------|---------|
-| MQTT_BROKER | tcp://localhost:1883 | MQTT broker URI (supports tcp://host:port). |
-| MQTT_USER | (empty) | MQTT username (omit for anonymous). |
-| MQTT_PASSWORD | (empty) | MQTT password (ignored if user empty). |
-| MQTT_CLIENT_ID | vanpix_rpi | MQTT client ID. |
-| MQTT_TOPIC_PREFIX | vanpix_rpi | Prefix for state & availability topics. |
-| INTERVAL_SECONDS | 30 | Sampling/publish interval (seconds). Must be >0. |
-| HA_DISCOVERY | true | Set false to disable publishing the HA discovery document. |
-| HA_PREFIX | homeassistant | Base HA discovery prefix. |
-| HA_DEVICE_IDENTIFIERS | (empty) | Comma-separated identifiers; first used as `device.ids`. |
-| HA_DEVICE_IDENTIFIER | (empty) | Fallback single identifier (if plural not set). |
-| HOST_ROOT_PATH | / | Path for disk stats (mount host root read-only for host numbers). |
-| APP_VERSION | (empty) | Explicit override for software version in discovery. |
-| IP_ADDRESS | (empty) | Static IP string injected into state JSON. |
-| IP_FILE | (empty) | Path to file containing IP string (first line trimmed). |
+- MQTT_BROKER (default `tcp://localhost:1883`)
+- MQTT_USER, MQTT_PASSWORD (optional; omit for anonymous)
+- MQTT_CLIENT_ID (default `vanpix_rpi`)
+- MQTT_TOPIC_PREFIX (default `vanpix_rpi`)
+- INTERVAL_SECONDS (default 30)
+- HA_DISCOVERY (default true)
+- HA_PREFIX (default `homeassistant`)
+- HA_DEVICE_IDENTIFIERS / HA_DEVICE_IDENTIFIER
+- HOST_ROOT_PATH (default `/`)
+- APP_VERSION
+- IP_ADDRESS / IP_FILE
 
-Removed / Ignored legacy vars: `DEVICE_NAME` (device name is fixed to "VanPIX- RPI"), any per-sensor topic overrides.
+Removed legacy: DEVICE_NAME, manufacturer overrides, temperature_f.
 
-## Versioning
-At build time you can inject version metadata (used as `sw` in discovery):
-```bash
-go build -ldflags "-X main.BuildTag=v1.3.0 -X main.BuildCommit=$(git rev-parse --short=7 HEAD)"
-```
-Resolution order: `APP_VERSION` env > `BuildTag` > short `BuildCommit` > `dev`.
+## Build
+- Go: 1.25
+- Dockerfile uses multi-stage build and injects VERSION and VCS_REF.
 
-## Building
-### Local (arm64 Raspberry Pi)
+### Local build
 ```bash
 GOOS=linux GOARCH=arm64 go build -o vanpix-rpi2mqtt .
 ```
+
 ### Docker
 ```bash
 docker build -t ghcr.io/xsmod/vanpix-rpi2mqtt:dev .
 ```
 
-## Running (basic)
+## Run
+Minimum to test anonymous MQTT and HA discovery:
 ```bash
-docker run -d --name vanpix-rpi --restart unless-stopped \
+docker run --rm \
   -e MQTT_BROKER=tcp://192.168.68.250:1883 \
   -e INTERVAL_SECONDS=15 \
   -e HA_DISCOVERY=true \
   -e HA_DEVICE_IDENTIFIER=vanpix_rpi_host \
-  -e IP_ADDRESS=192.168.68.250 \
   ghcr.io/xsmod/vanpix-rpi2mqtt:dev
 ```
 
-## Host vs Container Stats
-If you run unmodified, memory/cpu/uptime reflect the container's namespaces. To approximate host stats:
-- Run with `--pid=host` and/or mount `/proc` and `/sys` read-only (advanced) OR deploy on the host with minimal isolation.
-- For disk stats, mount the host root read-only and set `HOST_ROOT_PATH=/host`.
+Host vs Container stats note:
+- To reflect host disk, mount host root read-only and set HOST_ROOT_PATH=/host
+- For temperature, mount `/sys/class/thermal` read-only. CPU/mem/uptime still reflect container namespaces unless you relax isolation further (e.g., `--pid=host`).
 
-Example (disk & thermal only):
+Docker Compose example:
 ```yaml
 services:
   vanpix-rpi:
     image: ghcr.io/xsmod/vanpix-rpi2mqtt:latest
-    container_name: vanpix-rpi
     environment:
       - MQTT_BROKER=tcp://192.168.68.250:1883
       - HA_DEVICE_IDENTIFIER=vanpix_rpi_host
@@ -129,23 +114,11 @@ services:
     restart: unless-stopped
 ```
 
-## Home Assistant Integration
-1. Ensure MQTT integration is configured in HA.
-2. Set `HA_DISCOVERY=true` (default) and start the container.
-3. HA will create entities grouped under the device defined in the discovery document.
-4. Each entity uses `value_template` to extract its field from the single JSON state topic.
-5. Availability handled automatically via online/offline retained messages.
+## CI
+- GitHub Actions release workflow uses GoReleaser to push per-arch images and create manifests for tagged releases.
+- Commit workflow builds and pushes a multi-arch image tag `commit-<shortsha>` in a single step.
 
 ## Logs
-- Successful publish logs: `published <topic>`
-- Connection retries are silent until final failure.
-- On graceful shutdown: publishes offline then disconnects.
-
-## Extending / Customizing
-PRs welcome for:
-- Additional sensors (e.g., load averages, GPU temp, voltage).
-- Alternate discovery formats behind a toggle.
-- Optional compression of JSON payload.
-
-## License
-MIT
+- Connection retries are silent and only report final failure after attempts.
+- On publish success: `published <topic>` including the topic.
+- On graceful shutdown: publishes `offline` then disconnects.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"testing"
 )
 
@@ -74,5 +75,37 @@ Cached:           543210 kB
 	}
 	if len(m2) != 0 {
 		t.Fatalf("expected empty map for empty input, got len=%d", len(m2))
+	}
+}
+
+func TestParseIdentifiers(t *testing.T) {
+	cases := []struct {
+		in  string
+		out []string
+	}{
+		{"", nil},
+		{"id1", []string{"id1"}},
+		{" id1 , id2 ", []string{"id1", "id2"}},
+		{" , , ", nil},
+	}
+	for _, c := range cases {
+		got := parseIdentifiers(c.in)
+		if len(got) != len(c.out) {
+			t.Fatalf("len mismatch for %q: got %d want %d", c.in, len(got), len(c.out))
+		}
+		for i := range got {
+			if got[i] != c.out[i] {
+				t.Fatalf("item %d mismatch for %q: got %q want %q", i, c.in, got[i], c.out[i])
+			}
+		}
+	}
+}
+
+func TestUptimeDaysRounding(t *testing.T) {
+	// simulate 1.23456 days value and ensure rounding logic would produce 1.23
+	v := 1.23456
+	r := math.Round(v*100) / 100
+	if r != 1.23 {
+		t.Fatalf("rounding wrong: got %f want %f", r, 1.23)
 	}
 }

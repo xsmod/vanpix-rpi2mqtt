@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"strconv"
@@ -153,6 +154,13 @@ func main() {
 	opts := applyConfigToOptions(cfg)
 	// Set MQTT Last Will to offline so broker marks availability on ungraceful exit
 	opts.SetWill(availabilityTopic, "offline", 0, true)
+	// On every successful (re)connect publish availability online and discovery if enabled
+	opts.OnConnect = func(c mqtt.Client) {
+		publish(c, availabilityTopic, "online")
+		if cfg.HADiscovery {
+			publishDeviceDiscovery(c, cfg, deviceIdentifiers[0])
+		}
+	}
 	client := mqtt.NewClient(opts)
 
 	// Retry connect with backoff (silent until final failure)
@@ -171,15 +179,6 @@ func main() {
 	}
 	if !connected && lastErr != nil {
 		log.Printf("mqtt: failed to connect after %d attempts: %v", maxAttempts, lastErr)
-	}
-
-	if connected {
-		// Mark device online
-		publish(client, availabilityTopic, "online")
-	}
-
-	if connected && cfg.HADiscovery {
-		publishDeviceDiscovery(client, cfg, deviceIdentifiers[0])
 	}
 
 	ticker := time.NewTicker(time.Duration(cfg.IntervalSec) * time.Second)
@@ -208,7 +207,7 @@ func main() {
 			case <-time.After(3 * time.Second):
 				log.Println("timeout waiting for in-flight publishes")
 			}
-			// Mark device offline
+			// Mark device offline (explicit) before disconnect
 			publish(client, availabilityTopic, "offline")
 			if client != nil && client.IsConnected() {
 				client.Disconnect(250)
@@ -230,30 +229,34 @@ func publishDeviceState(client mqtt.Client, prefix string, s Stats) {
 
 type Stats struct {
 	CPULoad        float64 `json:"cpu_load"` // percent 0-100
-	TemperatureC   float64 `json:"temperature_c"`
-	TemperatureF   float64 `json:"temperature_f"`
+	Temperature    float64 `json:"temperature"`
 	MemTotalMB     int64   `json:"mem_total_mb"`
 	MemAvailableMB int64   `json:"mem_available_mb"`
 	MemFreeMB      int64   `json:"mem_free_mb"`
-	DiskTotalGB    float64 `json:"disk_total_gb"`
-	DiskFreeGB     float64 `json:"disk_free_gb"`
+	DiskTotalGB    int64   `json:"disk_total_gb"`
+	DiskFreeGB     int64   `json:"disk_free_gb"`
 	UptimeDays     float64 `json:"uptime_days"`
 	IP             string  `json:"ip"`
 }
 
 func gatherStats() Stats {
 	c := getTemperature()
-	f := c*9.0/5.0 + 32.0
+	ud := getUptimeDays()
+	ud = math.Round(ud*100) / 100 // round to 2 decimals for JSON output
+	cp := getCPUPercent()
+	cp = math.Round(cp*100) / 100 // round CPU percent to 2 decimals
+	// floor disk sizes to whole GB
+	dtot := int64(math.Floor(getDiskGB(hostDiskPath)))
+	dfree := int64(math.Floor(getDiskFreeGB(hostDiskPath)))
 	return Stats{
-		CPULoad:        getCPUPercent(),
-		TemperatureC:   c,
-		TemperatureF:   f,
+		CPULoad:        cp,
+		Temperature:    c,
 		MemTotalMB:     getMemTotalMB(),
 		MemAvailableMB: getMemAvailableMB(),
 		MemFreeMB:      getMemFreeMB(),
-		DiskTotalGB:    getDiskGB(hostDiskPath),
-		DiskFreeGB:     getDiskFreeGB(hostDiskPath),
-		UptimeDays:     getUptimeDays(),
+		DiskTotalGB:    dtot,
+		DiskFreeGB:     dfree,
+		UptimeDays:     ud,
 		IP:             getConfiguredIP(),
 	}
 }
@@ -273,26 +276,19 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			"value_template":      "{{ value_json.cpu_load }}",
 			"unit_of_measurement": "%",
 			"retain":              true,
+			"state_class":         "measurement",
+			"entity_category":     "diagnostic",
 		},
-		"temperature_c": {
-			"unique_id":           fmt.Sprintf("%s_temperature_c", DeviceIDConst),
-			"name":                "Temperature (C)",
-			"platform":            "sensor",
-			"state_topic":         stateTopic,
-			"value_template":      "{{ value_json.temperature_c }}",
-			"unit_of_measurement": "°C",
-			"device_class":        "temperature",
-			"retain":              true,
-		},
-		"temperature_f": {
-			"unique_id":           fmt.Sprintf("%s_temperature_f", DeviceIDConst),
-			"name":                "Temperature (F)",
-			"platform":            "sensor",
-			"state_topic":         stateTopic,
-			"value_template":      "{{ value_json.temperature_f }}",
-			"unit_of_measurement": "°F",
-			"device_class":        "temperature",
-			"retain":              true,
+		"temperature": {
+			"unique_id":       fmt.Sprintf("%s_temperature", DeviceIDConst),
+			"name":            "Temperature",
+			"platform":        "sensor",
+			"state_topic":     stateTopic,
+			"value_template":  "{{ value_json.temperature }}",
+			"device_class":    "temperature",
+			"retain":          true,
+			"state_class":     "measurement",
+			"entity_category": "diagnostic",
 		},
 		"mem_total_mb": {
 			"unique_id":           fmt.Sprintf("%s_mem_total_mb", DeviceIDConst),
@@ -303,6 +299,8 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			"unit_of_measurement": "MB",
 			"device_class":        "data_size",
 			"retain":              true,
+			"state_class":         "measurement",
+			"entity_category":     "diagnostic",
 		},
 		"mem_available_mb": {
 			"unique_id":           fmt.Sprintf("%s_mem_available_mb", DeviceIDConst),
@@ -313,6 +311,8 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			"unit_of_measurement": "MB",
 			"device_class":        "data_size",
 			"retain":              true,
+			"state_class":         "measurement",
+			"entity_category":     "diagnostic",
 		},
 		"mem_free_mb": {
 			"unique_id":           fmt.Sprintf("%s_mem_free_mb", DeviceIDConst),
@@ -323,6 +323,8 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			"unit_of_measurement": "MB",
 			"device_class":        "data_size",
 			"retain":              true,
+			"state_class":         "measurement",
+			"entity_category":     "diagnostic",
 		},
 		"disk_total_gb": {
 			"unique_id":           fmt.Sprintf("%s_disk_total_gb", DeviceIDConst),
@@ -333,6 +335,8 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			"unit_of_measurement": "GB",
 			"device_class":        "data_size",
 			"retain":              true,
+			"state_class":         "measurement",
+			"entity_category":     "diagnostic",
 		},
 		"disk_free_gb": {
 			"unique_id":           fmt.Sprintf("%s_disk_free_gb", DeviceIDConst),
@@ -343,6 +347,8 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			"unit_of_measurement": "GB",
 			"device_class":        "data_size",
 			"retain":              true,
+			"state_class":         "measurement",
+			"entity_category":     "diagnostic",
 		},
 		"uptime_days": {
 			"unique_id":           fmt.Sprintf("%s_uptime_days", DeviceIDConst),
@@ -353,6 +359,8 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 			"unit_of_measurement": "d",
 			"device_class":        "duration",
 			"retain":              true,
+			"state_class":         "measurement",
+			"entity_category":     "diagnostic",
 		},
 		"ip": {
 			"unique_id":      fmt.Sprintf("%s_ip", DeviceIDConst),
