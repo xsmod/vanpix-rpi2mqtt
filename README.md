@@ -8,6 +8,10 @@ Current behavior (v2+):
 - Optional HA discovery (single device document) published on every successful (re)connect at: `homeassistant/device/vanpix_rpi/config` when `HA_DISCOVERY=true` (retained, so HA always gets latest).
 - HA entities read fields from the shared JSON using `value_template` (no per-sensor state topics).
 
+Prefix normalization:
+- If you set `MQTT_TOPIC_PREFIX` to a single segment like `vanpi`, it will be expanded to `vanpi/sensor/vanpix_rpi` automatically.
+- If your prefix already has a slash (e.g., `vanpi/sensor/vanpix_rpi` or `custom/segment`), it is used as-is (trailing slash trimmed).
+
 Example state JSON:
 ```json
 {
@@ -27,13 +31,9 @@ HA discovery document (abridged):
 ```json
 {
   "device": {
-    "ids": "<first configured HA identifier or vanpix_rpi>",
-    "name": "VanPIX- RPI",
-    "manufacturer": "github.com/xsmod",
-    "model": "vanpix-rpi2mqtt",
-    "sw": "v1.0.0"
+    "ids": "<first configured HA identifier or vanpix_rpi>"
   },
-  "origin": { "name": "application" },
+  "origin": { "name": "vanpix-rpi2mqtt" },
   "components": {
     "cpu_load": { "platform": "sensor", "state_topic": "vanpix_rpi/state", "value_template": "{{ value_json.cpu_load }}", "unit_of_measurement": "%", "state_class": "measurement", "entity_category": "diagnostic" },
     "temperature": { "platform": "sensor", "state_topic": "vanpix_rpi/state", "value_template": "{{ value_json.temperature }}", "device_class": "temperature", "state_class": "measurement", "entity_category": "diagnostic" }
@@ -59,7 +59,7 @@ Discovery topic path is fixed to the constant device ID: `homeassistant/device/v
 - MQTT_BROKER (default `tcp://localhost:1883`)
 - MQTT_USER, MQTT_PASSWORD (optional; omit for anonymous)
 - MQTT_CLIENT_ID (default `vanpix_rpi`)
-- MQTT_TOPIC_PREFIX (default `vanpix_rpi`)
+- MQTT_TOPIC_PREFIX (default `vanpix_rpi`, see prefix normalization)
 - INTERVAL_SECONDS (default 30)
 - HA_DISCOVERY (default true)
 - HA_PREFIX (default `homeassistant`)
@@ -82,6 +82,19 @@ GOOS=linux GOARCH=arm64 go build -o vanpix-rpi2mqtt .
 ### Docker
 ```bash
 docker build -t ghcr.io/xsmod/vanpix-rpi2mqtt:dev .
+```
+
+Troubleshooting Docker builds:
+- If you target a specific architecture, pass build args so the builder cross-compiles accordingly:
+```bash
+docker build \
+  --build-arg TARGETOS=linux \
+  --build-arg TARGETARCH=amd64 \
+  -t ghcr.io/xsmod/vanpix-rpi2mqtt:dev .
+```
+- To see detailed progress output:
+```bash
+docker build --progress=plain .
 ```
 
 ## Run

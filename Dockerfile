@@ -15,7 +15,7 @@ COPY . .
 ENV CGO_ENABLED=0
 RUN GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -trimpath -ldflags "-s -w -X main.BuildTag=${VERSION} -X main.BuildCommit=${VCS_REF}" \
-    -o /vanpix-rpi2mqtt ./main.go
+    -o /vanpix-rpi2mqtt .
 
 # Runtime stage
 FROM alpine:3.20
