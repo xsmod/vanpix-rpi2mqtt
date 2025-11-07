@@ -89,11 +89,8 @@ func loadConfig() AppConfig {
 	if user == "" {
 		pass = ""
 	}
-	// HA device identifiers: support both singular and plural envs
+	// HA device identifiers: only read the plural env var; it can contain a single identifier as well
 	ids := env("HA_DEVICE_IDENTIFIERS", "")
-	if ids == "" {
-		ids = env("HA_DEVICE_IDENTIFIER", "")
-	}
 	// discovery toggle (default true)
 	haDisc := strings.ToLower(env("HA_DISCOVERY", "true")) != "false"
 	sw := getSWVersion()
