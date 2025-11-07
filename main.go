@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"os/signal"
 	"strconv"
@@ -13,7 +11,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unicode"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
@@ -24,17 +21,7 @@ const (
 
 var hostDiskPath string
 
-// Protect previous CPU counters for percent calculation across intervals
-var cpuMu sync.Mutex
-var prevCPUTotal uint64
-var prevCPUIdle uint64
-var prevCPUSet bool
-
 var (
-	// BuildTag and BuildCommit can be set via -ldflags at build time:
-	//   -ldflags "-X main.BuildTag=v1.2.3 -X main.BuildCommit=abcdef1"
-	BuildTag             string
-	BuildCommit          string
 	lastDiscoveryPublish time.Time
 )
 
@@ -58,25 +45,8 @@ type AppConfig struct {
 	HAPrefix      string
 	HostDiskPath  string
 	HAIdentifiers []string
-	SWVersion     string
+	DeviceID      string
 	HADiscovery   bool
-}
-
-func getSWVersion() string {
-	// Allow explicit override via APP_VERSION for special cases
-	if v := os.Getenv("APP_VERSION"); v != "" {
-		return v
-	}
-	if BuildTag != "" {
-		return BuildTag
-	}
-	if BuildCommit != "" {
-		if len(BuildCommit) >= 7 {
-			return BuildCommit[:7]
-		}
-		return BuildCommit
-	}
-	return "dev"
 }
 
 func loadConfig() AppConfig {
@@ -92,9 +62,9 @@ func loadConfig() AppConfig {
 	}
 	// HA device identifiers: only read the plural env var; it can contain a single identifier as well
 	ids := env("HA_DEVICE_IDENTIFIERS", "")
+	deviceID := env("DEVICE_ID", DeviceIDConst)
 	// discovery toggle (default true)
 	haDisc := strings.ToLower(env("HA_DISCOVERY", "true")) != "false"
-	sw := getSWVersion()
 	return AppConfig{
 		Broker:        env("MQTT_BROKER", "tcp://localhost:1883"),
 		User:          user,
@@ -105,7 +75,7 @@ func loadConfig() AppConfig {
 		HAPrefix:      env("HA_PREFIX", "homeassistant"),
 		HostDiskPath:  env("HOST_ROOT_PATH", "/"),
 		HAIdentifiers: parseIdentifiers(ids),
-		SWVersion:     sw,
+		DeviceID:      deviceID,
 		HADiscovery:   haDisc,
 	}
 }
@@ -128,35 +98,20 @@ func parseIdentifiers(s string) []string {
 	return out
 }
 
-// normalizePrefix turns a simple namespace like "vanpi" into
-// "vanpi/sensor/<deviceID>" so topics remain well-scoped.
-// Rules:
-// - Trim trailing slashes
-// - If resulting prefix has no slash, append "/sensor/<deviceID>"
-// - Otherwise, leave as-is
-func normalizePrefix(prefix, deviceID string) string {
-	p := strings.TrimSuffix(prefix, "/")
-	if !strings.Contains(p, "/") {
-		return fmt.Sprintf("%s/sensor/%s", p, deviceID)
+// publishDeviceState publishes a single JSON with all metrics to <prefix>/state.
+func publishDeviceState(client mqtt.Client, prefix string, s Stats) {
+	b, err := json.Marshal(s)
+	if err != nil {
+		log.Printf("publish %s/state failed: %v", prefix, err)
+		return
 	}
-	return p
-}
-
-func applyConfigToOptions(cfg AppConfig) *mqtt.ClientOptions {
-	opts := mqtt.NewClientOptions()
-	opts.AddBroker(cfg.Broker)
-	opts.SetClientID(cfg.ClientID)
-	if cfg.User != "" { // only set creds if username provided
-		opts.Username = cfg.User
-		opts.Password = cfg.Password
-	}
-	return opts
+	publish(client, fmt.Sprintf("%s/state", prefix), string(b))
 }
 
 func main() {
 	cfg := loadConfig()
 	hostDiskPath = cfg.HostDiskPath
-	deviceID := DeviceIDConst
+	deviceID := cfg.DeviceID
 	deviceIdentifiers := cfg.HAIdentifiers
 	if len(deviceIdentifiers) == 0 {
 		deviceIdentifiers = []string{deviceID}
@@ -168,23 +123,8 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	opts := applyConfigToOptions(cfg)
-	// Set MQTT Last Will to offline so broker marks availability on ungraceful exit
-	opts.SetWill(availabilityTopic, "offline", 0, true)
-	// On every successful (re)connect publish availability online and discovery if enabled
-	opts.OnConnect = func(c mqtt.Client) {
-		publish(c, availabilityTopic, "online")
-		if cfg.HADiscovery {
-			// Debounce: publish discovery only if last publish older than window
-			if time.Since(lastDiscoveryPublish) >= MinDiscoveryRepublishInterval {
-				publishDeviceDiscovery(c, cfg, deviceIdentifiers[0])
-				lastDiscoveryPublish = time.Now()
-			} else {
-				log.Printf("skip discovery publish (debounced, %v since last)", time.Since(lastDiscoveryPublish))
-			}
-		}
-	}
-	client := mqtt.NewClient(opts)
+	// Create MQTT client with encapsulated options and handlers
+	client := NewMQTTClient(cfg, topicPrefix, deviceIdentifiers)
 
 	// Retry connect with backoff (silent until final failure)
 	maxAttempts := 10
@@ -240,484 +180,13 @@ func main() {
 	}
 }
 
-// publishDeviceState publishes a single JSON with all metrics to <prefix>/state.
-func publishDeviceState(client mqtt.Client, prefix string, s Stats) {
-	b, err := json.Marshal(s)
-	if err != nil {
-		log.Printf("publish %s/state failed: %v", prefix, err)
-		return
+func applyConfigToOptions(cfg AppConfig) *mqtt.ClientOptions {
+	opts := mqtt.NewClientOptions()
+	opts.AddBroker(cfg.Broker)
+	opts.SetClientID(cfg.ClientID)
+	if cfg.User != "" { // only set creds if username provided
+		opts.Username = cfg.User
+		opts.Password = cfg.Password
 	}
-	publish(client, fmt.Sprintf("%s/state", prefix), string(b))
-}
-
-type Stats struct {
-	CPULoad        float64 `json:"cpu_load"` // percent 0-100
-	Temperature    float64 `json:"temperature"`
-	MemTotalMB     int64   `json:"mem_total_mb"`
-	MemAvailableMB int64   `json:"mem_available_mb"`
-	MemFreeMB      int64   `json:"mem_free_mb"`
-	DiskTotalGB    int64   `json:"disk_total_gb"`
-	DiskFreeGB     int64   `json:"disk_free_gb"`
-	UptimeDays     float64 `json:"uptime_days"`
-	IP             string  `json:"ip"`
-}
-
-func gatherStats() Stats {
-	c := getTemperature()
-	// Ensure temperature is an integer value (no decimals) for Home Assistant
-	c = math.Round(c)
-	ud := getUptimeDays()
-	ud = math.Round(ud*100) / 100 // round to 2 decimals for JSON output
-	cp := getCPUPercent()
-	cp = math.Round(cp*100) / 100 // round CPU percent to 2 decimals
-	// floor disk sizes to whole GB
-	dtot := int64(math.Floor(getDiskGB(hostDiskPath)))
-	dfree := int64(math.Floor(getDiskFreeGB(hostDiskPath)))
-	return Stats{
-		CPULoad:        cp,
-		Temperature:    c,
-		MemTotalMB:     getMemTotalMB(),
-		MemAvailableMB: getMemAvailableMB(),
-		MemFreeMB:      getMemFreeMB(),
-		DiskTotalGB:    dtot,
-		DiskFreeGB:     dfree,
-		UptimeDays:     ud,
-		IP:             getConfiguredIP(),
-	}
-}
-
-// sanitizeObjectID lowercases and replaces non-alphanumeric (except underscore) with underscores.
-// Use this when generating HA object_id / unique_id to ensure valid, stable names.
-func sanitizeObjectID(s string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
-			return unicode.ToLower(r)
-		}
-		return '_'
-	}, s)
-}
-
-// publishDeviceDiscovery publishes one discovery config per sensor (component) using the
-// Home Assistant component discovery format: <HA_PREFIX>/<component>/<object_id>/config.
-func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier string) {
-	// Use normalized prefix inside discovery as well
-	basePrefix := normalizePrefix(cfg.Prefix, DeviceIDConst)
-	availabilityTopic := fmt.Sprintf("%s/availability", basePrefix)
-	stateTopic := fmt.Sprintf("%s/state", basePrefix)
-
-	// Per-sensor templates (keys are the logical keys used in the state JSON)
-	components := map[string]map[string]interface{}{
-		"cpu_load": {
-			"name":                "CPU Load",
-			"state_topic":         stateTopic,
-			"value_template":      "{{ value_json.cpu_load }}",
-			"unit_of_measurement": "%",
-			"retain":              true,
-			"state_class":         "measurement",
-			"entity_category":     "diagnostic",
-		},
-		"temperature": {
-			"name":                "Temperature",
-			"state_topic":         stateTopic,
-			"value_template":      "{{ value_json.temperature }}",
-			"device_class":        "temperature",
-			"unit_of_measurement": "°C",
-			"retain":              true,
-			"state_class":         "measurement",
-			"entity_category":     "diagnostic",
-		},
-		"mem_total_mb": {
-			"name":                "Memory Total",
-			"state_topic":         stateTopic,
-			"value_template":      "{{ value_json.mem_total_mb }}",
-			"unit_of_measurement": "MB",
-			"device_class":        "data_size",
-			"retain":              true,
-			"state_class":         "measurement",
-			"entity_category":     "diagnostic",
-		},
-		"mem_available_mb": {
-			"name":                "Memory Available",
-			"state_topic":         stateTopic,
-			"value_template":      "{{ value_json.mem_available_mb }}",
-			"unit_of_measurement": "MB",
-			"device_class":        "data_size",
-			"retain":              true,
-			"state_class":         "measurement",
-			"entity_category":     "diagnostic",
-		},
-		"mem_free_mb": {
-			"name":                "Memory Free",
-			"state_topic":         stateTopic,
-			"value_template":      "{{ value_json.mem_free_mb }}",
-			"unit_of_measurement": "MB",
-			"device_class":        "data_size",
-			"retain":              true,
-			"state_class":         "measurement",
-			"entity_category":     "diagnostic",
-		},
-		"disk_total_gb": {
-			"name":                "Disk Total",
-			"state_topic":         stateTopic,
-			"value_template":      "{{ value_json.disk_total_gb }}",
-			"unit_of_measurement": "GB",
-			"device_class":        "data_size",
-			"retain":              true,
-			"state_class":         "measurement",
-			"entity_category":     "diagnostic",
-		},
-		"disk_free_gb": {
-			"name":                "Disk Free",
-			"state_topic":         stateTopic,
-			"value_template":      "{{ value_json.disk_free_gb }}",
-			"unit_of_measurement": "GB",
-			"device_class":        "data_size",
-			"retain":              true,
-			"state_class":         "measurement",
-			"entity_category":     "diagnostic",
-		},
-		"uptime_days": {
-			"name":                "Uptime Days",
-			"state_topic":         stateTopic,
-			"value_template":      "{{ value_json.uptime_days }}",
-			"unit_of_measurement": "d",
-			"device_class":        "duration",
-			"retain":              true,
-			"state_class":         "measurement",
-			"entity_category":     "diagnostic",
-		},
-		"ip": {
-			"name":            "IP Address",
-			"state_topic":     stateTopic,
-			"retain":          true,
-			"entity_category": "diagnostic",
-		},
-	}
-
-	// Build identifiers list: DeviceIDConst first, then env-provided identifiers (deduped), then the passed deviceIdentifier if new.
-	identMap := map[string]bool{}
-	identifiers := make([]string, 0, 1+len(cfg.HAIdentifiers))
-	addIdent := func(id string) {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			return
-		}
-		if !identMap[id] {
-			identMap[id] = true
-			identifiers = append(identifiers, id)
-		}
-	}
-	addIdent(DeviceIDConst)
-	for _, id := range cfg.HAIdentifiers {
-		addIdent(id)
-	}
-	addIdent(deviceIdentifier)
-
-	// Device object to inject into each entity config
-	deviceObj := map[string]interface{}{
-		"identifiers": identifiers,
-	}
-	if len(cfg.HAIdentifiers) == 0 {
-		deviceObj["name"] = "VanPIX RPI"
-		deviceObj["manufacturer"] = "github.com/xsmod"
-		deviceObj["model"] = "vanpix-rpi2mqtt"
-	}
-
-	// Publish one discovery config per component under homeassistant/<component>/<object_id>/config
-	for key, tmpl := range components {
-		// copy template to avoid mutating original
-		m := map[string]interface{}{}
-		for k, v := range tmpl {
-			m[k] = v
-		}
-
-		// inject device and availability fields
-		m["device"] = deviceObj
-		m["availability_topic"] = availabilityTopic
-		m["payload_available"] = "online"
-		m["payload_not_available"] = "offline"
-		m["qos"] = 2
-		m["retain"] = true
-
-		// determine object id and unique id
-		objectID := sanitizeObjectID(fmt.Sprintf("%s_%s", DeviceIDConst, key))
-		m["unique_id"] = objectID
-
-		// component type for discovery topic — we are publishing sensors
-		componentType := "sensor"
-
-		payload, _ := json.Marshal(m)
-		topic := fmt.Sprintf("%s/%s/%s/config", cfg.HAPrefix, componentType, objectID)
-		client.Publish(topic, 0, true, string(payload)).Wait()
-		log.Printf("published %s", topic)
-	}
-}
-
-// getCPUPercent computes CPU usage percent over the interval between calls using /proc/stat.
-func getCPUPercent() float64 {
-	idle, total := readCPUTimes()
-	cpuMu.Lock()
-	defer cpuMu.Unlock()
-	if !prevCPUSet {
-		prevCPUIdle, prevCPUTotal, prevCPUSet = idle, total, true
-		return 0.0
-	}
-	deltaIdle := float64(idle - prevCPUIdle)
-	deltaTotal := float64(total - prevCPUTotal)
-	prevCPUIdle, prevCPUTotal = idle, total
-	if deltaTotal <= 0 {
-		return 0.0
-	}
-	usage := (1.0 - deltaIdle/deltaTotal) * 100.0
-	if usage < 0 {
-		usage = 0
-	}
-	if usage > 100 {
-		usage = 100
-	}
-	return usage
-}
-
-// readCPUTimes reads the first line of /proc/stat and returns (idle, total) jiffies.
-func readCPUTimes() (idle, total uint64) {
-	b, err := os.ReadFile("/proc/stat")
-	if err != nil {
-		return 0, 0
-	}
-	s := bufio.NewScanner(strings.NewReader(string(b)))
-	for s.Scan() {
-		line := s.Text()
-		if !strings.HasPrefix(line, "cpu ") {
-			continue
-		}
-		fields := strings.Fields(line)[1:]
-		var vals []uint64
-		for _, f := range fields {
-			v, err := strconv.ParseUint(f, 10, 64)
-			if err != nil {
-				v = 0
-			}
-			vals = append(vals, v)
-		}
-		// According to procfs, the first fields are:
-		// user nice system idle iowait irq softirq steal guest guest_nice
-		var user, nice, system, idleVal, iowait, irq, softirq, steal uint64
-		if len(vals) > 0 {
-			user = vals[0]
-		}
-		if len(vals) > 1 {
-			nice = vals[1]
-		}
-		if len(vals) > 2 {
-			system = vals[2]
-		}
-		if len(vals) > 3 {
-			idleVal = vals[3]
-		}
-		if len(vals) > 4 {
-			iowait = vals[4]
-		}
-		if len(vals) > 5 {
-			irq = vals[5]
-		}
-		if len(vals) > 6 {
-			softirq = vals[6]
-		}
-		if len(vals) > 7 {
-			steal = vals[7]
-		}
-		total := user + nice + system + idleVal + iowait + irq + softirq + steal
-		return idleVal + iowait, total
-	}
-	return 0, 0
-}
-
-// parseLoadAvgFromBytes remains for tests but is no longer used for CPU percent.
-func parseLoadAvgFromBytes(b []byte) string {
-	parts := strings.Fields(string(b))
-	if len(parts) < 1 {
-		return ""
-	}
-	return parts[0]
-}
-
-func getTemperature() float64 {
-	// Try common thermal zone files
-	paths := []string{"/sys/class/thermal/thermal_zone0/temp"}
-	for _, p := range paths {
-		if _, err := os.Stat(p); err == nil {
-			b, err := os.ReadFile(p)
-			if err == nil {
-				s := strings.TrimSpace(string(b))
-				v, err := strconv.ParseFloat(s, 64)
-				if err == nil {
-					// many kernels report millidegrees
-					if v > 1000 {
-						return v / 1000.0
-					}
-					return v
-				}
-			}
-		}
-	}
-	// Try vcgencmd fallback (not available in repo image)
-	return 0.0
-}
-
-func getMemTotalMB() int64 {
-	m := parseMemInfo()
-	if v, ok := m["MemTotal"]; ok {
-		return v / 1024
-	}
-	return 0
-}
-
-func getMemAvailableMB() int64 {
-	m := parseMemInfo()
-	if v, ok := m["MemAvailable"]; ok {
-		return v / 1024
-	}
-	// Fallback to MemFree
-	if v, ok := m["MemFree"]; ok {
-		return v / 1024
-	}
-	return 0
-}
-
-func getMemFreeMB() int64 {
-	m := parseMemInfo()
-	if v, ok := m["MemFree"]; ok {
-		return v / 1024
-	}
-	return 0
-}
-
-func parseMemInfo() map[string]int64 {
-	b, err := os.ReadFile("/proc/meminfo")
-	if err != nil {
-		return nil
-	}
-	return parseMemInfoFromBytes(b)
-}
-
-// parseMemInfoFromBytes parses the contents of /proc/meminfo into a map of values (kB).
-func parseMemInfoFromBytes(b []byte) map[string]int64 {
-	m := map[string]int64{}
-	s := bufio.NewScanner(strings.NewReader(string(b)))
-	for s.Scan() {
-		line := s.Text()
-		parts := strings.Split(line, ":")
-		if len(parts) < 2 {
-			continue
-		}
-		key := strings.TrimSpace(parts[0])
-		valStr := strings.TrimSpace(parts[1])
-		valFields := strings.Fields(valStr)
-		if len(valFields) == 0 {
-			continue
-		}
-		v, err := strconv.ParseInt(valFields[0], 10, 64)
-		if err == nil {
-			m[key] = v
-		}
-	}
-	return m
-}
-
-// parseUptimeFromBytes parses the first number from /proc/uptime and returns seconds.
-func parseUptimeFromBytes(b []byte) int64 {
-	parts := strings.Fields(string(b))
-	if len(parts) < 1 {
-		return 0
-	}
-	f, err := strconv.ParseFloat(parts[0], 64)
-	if err != nil {
-		return 0
-	}
-	return int64(f)
-}
-
-// parseUptimeSecondsFromBytes returns the uptime in seconds as float64 (keeps fractional seconds).
-func parseUptimeSecondsFromBytes(b []byte) float64 {
-	parts := strings.Fields(string(b))
-	if len(parts) < 1 {
-		return 0
-	}
-	f, err := strconv.ParseFloat(parts[0], 64)
-	if err != nil {
-		return 0
-	}
-	return f
-}
-
-// getUptimeDays reads /proc/uptime and returns the uptime in days as float64.
-func getUptimeDays() float64 {
-	b, err := os.ReadFile("/proc/uptime")
-	if err != nil {
-		return 0.0
-	}
-	secs := parseUptimeSecondsFromBytes(b)
-	return secs / 86400.0
-}
-
-func getDiskGB(path string) float64 {
-	fs := syscall.Statfs_t{}
-	_ = syscall.Statfs(path, &fs)
-	total := float64(fs.Blocks) * float64(fs.Bsize)
-	return total / (1024.0 * 1024.0 * 1024.0)
-}
-
-func getDiskFreeGB(path string) float64 {
-	fs := syscall.Statfs_t{}
-	_ = syscall.Statfs(path, &fs)
-	free := float64(fs.Bavail) * float64(fs.Bsize)
-	return free / (1024.0 * 1024.0 * 1024.0)
-}
-
-func getConfiguredIP() string {
-	if v := os.Getenv("IP_ADDRESS"); v != "" {
-		return v
-	}
-	if fp := os.Getenv("IP_FILE"); fp != "" {
-		b, err := os.ReadFile(fp)
-		if err == nil {
-			ip := strings.TrimSpace(string(b))
-			if ip != "" {
-				return ip
-			}
-		}
-	}
-	return ""
-}
-
-// publish sends a retained MQTT message to the given topic.
-// Behavior:
-// - If disconnected, it performs a short, silent reconnect attempt.
-// - On failure (timeout/error), it logs with the topic and reason.
-// - On success, it logs a clear sentence including the topic.
-func publish(client mqtt.Client, topic, payload string) {
-	if client == nil {
-		log.Printf("mqtt client nil, cannot publish %s", topic)
-		return
-	}
-	if !client.IsConnected() {
-		if token := client.Connect(); token != nil {
-			_ = token.WaitTimeout(2 * time.Second)
-		}
-	}
-	if !client.IsConnected() {
-		log.Printf("publish %s skipped: mqtt disconnected", topic)
-		return
-	}
-	t := client.Publish(topic, 0, true, payload)
-	if ok := t.WaitTimeout(5 * time.Second); !ok {
-		log.Printf("publish %s failed: timeout", topic)
-		return
-	}
-	if err := t.Error(); err != nil {
-		log.Printf("publish %s failed: %v", topic, err)
-		return
-	}
-	// Success: log a clear, human-friendly line including the topic
-	log.Printf("published %s", topic)
+	return opts
 }

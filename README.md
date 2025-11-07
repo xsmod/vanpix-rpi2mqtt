@@ -22,8 +22,7 @@ Example state JSON:
   "mem_free_mb": 1422,
   "disk_total_gb": 58,
   "disk_free_gb": 41,
-  "uptime_days": 17.91,
-  "ip": "192.168.68.250"
+  "uptime_days": 17.91
 }
 ```
 
@@ -53,30 +52,67 @@ Discovery topic path is fixed to the constant device ID: `homeassistant/device/v
 - mem_total_mb / mem_available_mb / mem_free_mb: Memory stats in MB.
 - disk_total_gb / disk_free_gb: Whole GB values (floored) of host filesystem.
 - uptime_days: Uptime in days (2 decimals).
-- ip: Provided IP string (env/file).
 
 ## Environment Variables
-- MQTT_BROKER (default `tcp://localhost:1883`)
-- MQTT_USER, MQTT_PASSWORD (optional; omit for anonymous)
-- MQTT_CLIENT_ID (default `vanpix_rpi`)
-- MQTT_TOPIC_PREFIX (default `vanpix_rpi`, see prefix normalization)
-- INTERVAL_SECONDS (default 30)
-- HA_DISCOVERY (default true)
-- HA_PREFIX (default `homeassistant`)
-- HA_DEVICE_IDENTIFIERS / HA_DEVICE_IDENTIFIER
-- HOST_ROOT_PATH (default `/`)
-- APP_VERSION
-- IP_ADDRESS / IP_FILE
+
+Each environment variable below includes whether it's optional and the default value; all are read from the environment at startup.
+
+| Variable | Required | Default | Description |
+|---|---:|---|---|
+| MQTT_BROKER | optional | `tcp://localhost:1883` | MQTT broker URL to connect to (e.g. `tcp://192.168.1.10:1883`). |
+| MQTT_USER | optional | `` (empty) | Username for broker authentication (leave empty for anonymous). |
+| MQTT_PASSWORD | optional | `` (empty) | Password for broker authentication (used only if MQTT_USER is set). |
+| MQTT_CLIENT_ID | optional | `vanpix_rpi` | MQTT client id used when connecting to the broker. |
+| MQTT_TOPIC_PREFIX | optional | `vanpix_rpi` | Base topic prefix for published state and availability. If a single segment is supplied (e.g. `vanpi`) it is normalized to `<prefix>/sensor/<device_id>`. |
+| INTERVAL_SECONDS | optional | `30` | How often (seconds) the aggregated JSON state is published. |
+| HA_DISCOVERY | optional | `true` | Toggle Home Assistant MQTT discovery; set to `false` to disable discovery messages. |
+| HA_PREFIX | optional | `homeassistant` | MQTT discovery prefix used by Home Assistant. |
+| HA_DEVICE_IDENTIFIERS | optional | `` (none) | Comma-separated list of stable device identifiers (e.g. `serial123,mac:AA:BB:CC`). These will be published as `device.identifiers` in discovery payloads; values are trimmed and deduplicated. The configured `DEVICE_ID` is always the first identifier. |
+| DEVICE_ID | optional | `vanpix_rpi` | Canonical device id used in discovery topics and as the first element of `device.identifiers`. Set `DEVICE_ID` to override the default. |
+| HOST_ROOT_PATH | optional | `/` | When running in Docker you can mount the host root and set this to e.g. `/host` so disk stats reflect the host filesystem. |
+
+Example — multiple identifiers:
+```bash
+export HA_DEVICE_IDENTIFIERS="serial123,mac:AA:BB:CC"
+```
+
+Example — resulting `device.identifiers` JSON (two cases):
+
+When `HA_DEVICE_IDENTIFIERS` is set (and `DEVICE_ID=vanpix_rpi`):
+```json
+{
+  "device": {
+    "identifiers": ["vanpix_rpi", "serial123", "mac:AA:BB:CC", "dev-ident"]
+  }
+}
+```
+
+When `HA_DEVICE_IDENTIFIERS` is empty (no extra identifiers) the default device id is still included and friendly metadata is added:
+```json
+{
+  "device": {
+    "identifiers": ["vanpix_rpi"],
+    "name": "VanPIX RPI",
+    "manufacturer": "github.com/xsmod",
+    "model": "vanpix-rpi2mqtt"
+  }
+}
+```
 
 Removed legacy: DEVICE_NAME, manufacturer overrides, temperature_f.
 
 ## Build
 - Go: 1.25
-- Dockerfile uses multi-stage build and injects VERSION and VCS_REF.
+- Dockerfile uses a multi-stage build for producing a compact runtime image.
 
 ### Local build
 ```bash
 GOOS=linux GOARCH=arm64 go build -o vanpix-rpi2mqtt .
+```
+
+Note: the project no longer embeds a runtime version string by default. The binary is built directly with `go build` (or via the provided Dockerfile/.goreleaser). If you want to embed a version into the binary, re-introduce build-time ldflags and corresponding variables in `main.go` (for example `var BuildTag string`) and build with:
+```bash
+go build -ldflags "-X main.BuildTag=v1.2.3 -X main.BuildCommit=abcdef" -o vanpix-rpi2mqtt .
 ```
 
 ### Docker
@@ -104,7 +140,7 @@ docker run --rm \
   -e MQTT_BROKER=tcp://192.168.68.250:1883 \
   -e INTERVAL_SECONDS=15 \
   -e HA_DISCOVERY=true \
-  -e HA_DEVICE_IDENTIFIER=vanpix_rpi_host \
+  -e HA_DEVICE_IDENTIFIERS=vanpix_rpi \
   ghcr.io/xsmod/vanpix-rpi2mqtt:dev
 ```
 
@@ -119,7 +155,7 @@ services:
     image: ghcr.io/xsmod/vanpix-rpi2mqtt:latest
     environment:
       - MQTT_BROKER=tcp://192.168.68.250:1883
-      - HA_DEVICE_IDENTIFIER=vanpix_rpi_host
+      - HA_DEVICE_IDENTIFIERS=vanpix_rpi
       - HOST_ROOT_PATH=/host
     volumes:
       - /:/host:ro

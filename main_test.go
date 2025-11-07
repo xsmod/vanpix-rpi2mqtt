@@ -120,6 +120,8 @@ func TestNormalizePrefix(t *testing.T) {
 		{"vanpi/segment", "dev123", "vanpi/segment"},
 		{"vanpi/segment/", "dev123", "vanpi/segment"},
 		{"another", "vanpix_rpi", "another/sensor/vanpix_rpi"},
+		{"vanpi/segment/extra", "dev123", "vanpi/segment/extra"},
+		{"vanpi/sensor/rpi", "dev123", "vanpi/sensor/dev123"},
 	}
 	for _, c := range cases {
 		got := normalizePrefix(c.in, c.deviceID)

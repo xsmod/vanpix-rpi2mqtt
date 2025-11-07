@@ -20,7 +20,7 @@ builds:
     flags:
       - -trimpath
     ldflags:
-      - -s -w -X main.BuildTag={{ .Version }} -X main.BuildCommit={{ .FullCommit }}
+      - -s -w
 
 dockers:
   - id: image-amd64
