@@ -130,6 +130,20 @@ func parseIdentifiers(s string) []string {
 	return out
 }
 
+// normalizePrefix turns a simple namespace like "vanpi" into
+// "vanpi/sensor/<deviceID>" so topics remain well-scoped.
+// Rules:
+// - Trim trailing slashes
+// - If resulting prefix has no slash, append "/sensor/<deviceID>"
+// - Otherwise, leave as-is
+func normalizePrefix(prefix, deviceID string) string {
+	p := strings.TrimSuffix(prefix, "/")
+	if !strings.Contains(p, "/") {
+		return fmt.Sprintf("%s/sensor/%s", p, deviceID)
+	}
+	return p
+}
+
 func applyConfigToOptions(cfg AppConfig) *mqtt.ClientOptions {
 	opts := mqtt.NewClientOptions()
 	opts.AddBroker(cfg.Broker)
@@ -150,7 +164,9 @@ func main() {
 		deviceIdentifiers = []string{deviceID}
 	}
 
-	availabilityTopic := fmt.Sprintf("%s/availability", cfg.Prefix)
+	// Use normalized prefix so users can set just "vanpi" and get "vanpi/sensor/<device>" topics.
+	topicPrefix := normalizePrefix(cfg.Prefix, deviceID)
+	availabilityTopic := fmt.Sprintf("%s/availability", topicPrefix)
 
 	var wg sync.WaitGroup
 
@@ -204,7 +220,7 @@ func main() {
 			go func() {
 				defer wg.Done()
 				report := gatherStats()
-				publishDeviceState(client, cfg.Prefix, report)
+				publishDeviceState(client, topicPrefix, report)
 			}()
 		case sig := <-sigCh:
 			log.Printf("received signal %v, shutting down", sig)
@@ -272,8 +288,10 @@ func gatherStats() Stats {
 
 // publishDeviceDiscovery publishes a single device discovery JSON following the requested schema.
 func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier string) {
-	availabilityTopic := fmt.Sprintf("%s/availability", cfg.Prefix)
-	stateTopic := fmt.Sprintf("%s/state", cfg.Prefix)
+	// Use normalized prefix inside discovery as well
+	basePrefix := normalizePrefix(cfg.Prefix, DeviceIDConst)
+	availabilityTopic := fmt.Sprintf("%s/availability", basePrefix)
+	stateTopic := fmt.Sprintf("%s/state", basePrefix)
 
 	components := map[string]map[string]interface{}{
 		"cpu_load": {

@@ -109,3 +109,22 @@ func TestUptimeDaysRounding(t *testing.T) {
 		t.Fatalf("rounding wrong: got %f want %f", r, 1.23)
 	}
 }
+
+func TestNormalizePrefix(t *testing.T) {
+	cases := []struct {
+		in       string
+		deviceID string
+		want     string
+	}{
+		{"vanpi", "dev123", "vanpi/sensor/dev123"},
+		{"vanpi/segment", "dev123", "vanpi/segment"},
+		{"vanpi/segment/", "dev123", "vanpi/segment"},
+		{"another", "vanpix_rpi", "another/sensor/vanpix_rpi"},
+	}
+	for _, c := range cases {
+		got := normalizePrefix(c.in, c.deviceID)
+		if got != c.want {
+			t.Fatalf("normalizePrefix(%q, %q) = %q; want %q", c.in, c.deviceID, got, c.want)
+		}
+	}
+}
