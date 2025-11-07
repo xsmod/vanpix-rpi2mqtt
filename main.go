@@ -32,9 +32,12 @@ var prevCPUSet bool
 var (
 	// BuildTag and BuildCommit can be set via -ldflags at build time:
 	//   -ldflags "-X main.BuildTag=v1.2.3 -X main.BuildCommit=abcdef1"
-	BuildTag    string
-	BuildCommit string
+	BuildTag             string
+	BuildCommit          string
+	lastDiscoveryPublish time.Time
 )
+
+const MinDiscoveryRepublishInterval = 30 * time.Second // debounce window
 
 func env(key, def string) string {
 	v := os.Getenv(key)
@@ -158,7 +161,13 @@ func main() {
 	opts.OnConnect = func(c mqtt.Client) {
 		publish(c, availabilityTopic, "online")
 		if cfg.HADiscovery {
-			publishDeviceDiscovery(c, cfg, deviceIdentifiers[0])
+			// Debounce: publish discovery only if last publish older than window
+			if time.Since(lastDiscoveryPublish) >= MinDiscoveryRepublishInterval {
+				publishDeviceDiscovery(c, cfg, deviceIdentifiers[0])
+				lastDiscoveryPublish = time.Now()
+			} else {
+				log.Printf("skip discovery publish (debounced, %v since last)", time.Since(lastDiscoveryPublish))
+			}
 		}
 	}
 	client := mqtt.NewClient(opts)

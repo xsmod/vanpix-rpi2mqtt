@@ -122,3 +122,6 @@ services:
 - Connection retries are silent and only report final failure after attempts.
 - On publish success: `published <topic>` including the topic.
 - On graceful shutdown: publishes `offline` then disconnects.
+
+## Discovery
+- Discovery is republished on each successful (re)connect, but debounced (min 30s between publishes) to avoid flapping storms. The payload is retained.
