@@ -143,13 +143,14 @@ func buildDiscoveryConfigs(cfg AppConfig, deviceID, deviceIdentifier string) []s
 		m["qos"] = 2
 		m["retain"] = true
 
-		// unique_id removed: not required
-
 		deviceSeg := sanitizeObjectID(deviceID)
 		sensorSeg := sanitizeObjectID(key)
-		payload, _ := json.Marshal(m)
-		topic := fmt.Sprintf("%s/sensor/%s/%s/config", cfg.HAPrefix, deviceSeg, sensorSeg)
-		out = append(out, struct{ topic, payload string }{topic: topic, payload: string(payload)})
+		objectID := fmt.Sprintf("%s_%s", deviceSeg, sensorSeg)
+		m["object_id"] = objectID
+		m["unique_id"] = objectID // restore unique_id; improves HA registration reliability
+		payloadBytes, _ := json.Marshal(m)
+		topic := fmt.Sprintf("%s/sensor/%s/config", cfg.HAPrefix, objectID)
+		out = append(out, struct{ topic, payload string }{topic: topic, payload: string(payloadBytes)})
 	}
 	return out
 }
@@ -162,6 +163,6 @@ func publishDeviceDiscovery(client mqtt.Client, cfg AppConfig, deviceIdentifier 
 	pairs := buildDiscoveryConfigs(cfg, cfg.DeviceID, deviceIdentifier)
 	for _, p := range pairs {
 		client.Publish(p.topic, 0, true, p.payload).Wait()
-		log.Printf("published %s", p.topic)
+		log.Printf("published discovery config %s payload=%s", p.topic, p.payload)
 	}
 }
